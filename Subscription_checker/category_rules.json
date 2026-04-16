@@ -2,7 +2,8 @@
   "Shopping": [
     "amazon marketplace",
     "amazon prime",
-    "instacart"
+    "instacart",
+    "Paypal"
   ],
   "Streaming": [
     "netflix",
@@ -10,6 +11,7 @@
     "hulu",
     "disney+",
     "youtube",
+    "Spotify",
     "prime video"
   ],
   "Technology": [
@@ -26,5 +28,37 @@
   "Food Delivery": [
     "doordash",
     "uber one"
+  ],
+  "Phone Plan": [
+    "Google Fi",
+    "Att&t",
+    "Verizon",
+    "T-Mobile"
+  ],
+  "Insurance": [
+    "State Farm Insurance",
+    "Kaiser Perminente",
+    "KP"
+],
+  "Internet": [
+    "Ziply Fiber",
+    "Comcast"
+ ],
+  "Food & Grocery": [
+    "Fred Meyer",
+    "Safeway",
+    "QFC",
+    "Albertsons",
+    "WholeFoods"
+  ],
+  "Home Services": [
+    "Merry Maids"
+  ],
+  "Child expenses": [
+    "Mountlake Terrace"
+
+ ],
+  "Travel": [
+    "Delta"
   ]
 }
