@@ -1,0 +1,30 @@
+{
+  "Shopping": [
+    "amazon marketplace",
+    "amazon prime",
+    "instacart"
+  ],
+  "Streaming": [
+    "netflix",
+    "spotify",
+    "hulu",
+    "disney+",
+    "youtube",
+    "prime video"
+  ],
+  "Technology": [
+    "apple services",
+    "google services",
+    "microsoft",
+    "openai",
+    "adobe",
+    "dropbox",
+    "notion",
+    "slack",
+    "zoom"
+  ],
+  "Food Delivery": [
+    "doordash",
+    "uber one"
+  ]
+}
