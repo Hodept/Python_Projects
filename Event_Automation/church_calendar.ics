@@ -1,0 +1,27 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Church Newsletter Calendar Extractor//EN
+CALSCALE:GREGORIAN
+METHOD:PUBLISH
+BEGIN:VEVENT
+UID:16ff6f8c31d8f05a@church-newsletter
+DTSTAMP:20260609T192258Z
+DTSTART;TZID=America/Los_Angeles:20260612T193000
+DTEND;TZID=America/Los_Angeles:20260612T203000
+SUMMARY:Ensign Symphony & Chorus presents "Americana"
+LOCATION:Benaroya Hall
+DESCRIPTION:Ensign Symphony & Chorus presents "Americana"\, Benaroya Hall\
+ , 7:30pm\nSource: Weekly Newsletter - Week of June 7 2026.pdf
+END:VEVENT
+BEGIN:VEVENT
+UID:fdaf2cbe2707d73c@church-newsletter
+DTSTAMP:20260609T192258Z
+DTSTART;TZID=America/Los_Angeles:20260626T180000
+DTEND;TZID=America/Los_Angeles:20260626T190000
+SUMMARY:“Songs of Hope” Tabernacle Choir and Orchestra at Temple Square
+LOCATION:Stake Center
+DESCRIPTION:“Songs of Hope” Tabernacle Choir and Orchestra at Temple Squar
+ e\, Stake Center\, 6:00pm\nSource: Weekly Newsletter - Week of June 7 2026
+ .pdf
+END:VEVENT
+END:VCALENDAR
