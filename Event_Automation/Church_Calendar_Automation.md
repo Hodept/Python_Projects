@@ -44,16 +44,16 @@ Run the extractor from the `Event_Automation` folder:
 python3 extract_church_calendar.py
 ```
 
-This reads PDFs from:
-
-```text
-Church Newsletters/
-```
-
-And writes:
+This reads PDFs from the current folder and writes:
 
 ```text
 church_calendar.ics
+```
+
+To read PDFs from another folder, pass the folder path:
+
+```bash
+python3 extract_church_calendar.py --input-dir "/path/to/newsletter pdf folder"
 ```
 
 ### Generate ICS and JSON
@@ -64,7 +64,25 @@ python3 extract_church_calendar.py --json-output church_calendar_events.json
 
 Use this most of the time. The `.ics` file is used by the Playwright importer, and the `.json` file is easier to inspect by hand.
 
+The extractor also adds a short subject-focused hype statement to each event description before writing the `.ics` file.
+
+### Pause and Add Event Details
+
+Use interactive mode when you want to review each event and add extra description details before the `.ics` file is written:
+
+```bash
+python3 extract_church_calendar.py --interactive --json-output church_calendar_events.json
+```
+
+For each event, the script shows the subject, time, location, and suggested hype statement. Type any extra details you want included, then press Enter on a blank line to continue to the next event.
+
 ### Use a Different PDF Folder
+
+```bash
+python3 extract_church_calendar.py --input-dir "/path/to/newsletter pdf folder"
+```
+
+The positional form also works:
 
 ```bash
 python3 extract_church_calendar.py "/path/to/newsletter pdf folder"

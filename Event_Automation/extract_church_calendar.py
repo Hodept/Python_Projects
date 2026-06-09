@@ -8,16 +8,16 @@ import hashlib
 import json
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 
-DEFAULT_INPUT_DIR = Path(__file__).with_name("Church Newsletters")
 DEFAULT_OUTPUT_FILE = Path(__file__).with_name("church_calendar.ics")
 DEFAULT_TIMEZONE = "America/Los_Angeles"
 DEFAULT_DURATION_MINUTES = 60
+HYPE_PREFIX = "Hype statement:"
 
 SECTION_RE = re.compile(r"^Calendar (?:Events|Items)\s*$", re.IGNORECASE)
 NEXT_SECTION_RE = re.compile(r"^[A-Z][A-Za-z& ]{2,}$")
@@ -121,6 +121,62 @@ def split_event_text(text: str) -> tuple[str, str]:
     if time_match:
         return without_time, ""
     return text.strip(), ""
+
+
+def event_subject(event: CalendarEvent) -> str:
+    return event.summary.strip(" .")
+
+
+def build_hype_statement(event: CalendarEvent) -> str:
+    subject = event_subject(event)
+    if not subject:
+        return ""
+
+    location = f" at {event.location}" if event.location else ""
+    return f"Come be part of {subject}{location} - a meaningful opportunity to gather, connect, and be uplifted."
+
+
+def description_with_hype(event: CalendarEvent, extra_details: str = "") -> str:
+    parts = [
+        f"{HYPE_PREFIX} {build_hype_statement(event)}",
+        "",
+        "Event details:",
+        event.description,
+    ]
+    if extra_details.strip():
+        parts.extend(["", "Additional details:", extra_details.strip()])
+    return "\n".join(part for part in parts if part is not None)
+
+
+def prompt_multiline_details() -> str:
+    print("Add any extra details for this event. Press Enter on a blank line to keep moving.")
+    lines: list[str] = []
+    while True:
+        line = input("> ")
+        if not line:
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def enrich_event_descriptions(events: list[CalendarEvent], interactive: bool) -> list[CalendarEvent]:
+    enriched: list[CalendarEvent] = []
+    sorted_events = sorted(events, key=lambda item: (item.start, item.summary))
+    for index, event in enumerate(sorted_events, start=1):
+        extra_details = ""
+        if interactive:
+            print()
+            print(f"Event {index} of {len(sorted_events)}")
+            print(f"Subject: {event_subject(event)}")
+            print(f"When: {event.start:%Y-%m-%d %I:%M %p}")
+            if event.location:
+                print(f"Where: {event.location}")
+            print(f"Suggested hype: {build_hype_statement(event)}")
+            extra_details = prompt_multiline_details()
+        enriched.append(
+            replace(event, description=description_with_hype(event, extra_details))
+        )
+    return enriched
 
 
 def parse_calendar_events(pdf_path: Path, timezone_name: str) -> list[CalendarEvent]:
@@ -252,6 +308,11 @@ def dedupe_events(events: list[CalendarEvent]) -> list[CalendarEvent]:
     return list(unique.values())
 
 
+def selected_input_dir(positional_dir: Path | None, option_dir: Path | None) -> Path:
+    input_dir = option_dir or positional_dir or Path.cwd()
+    return input_dir.expanduser()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Extract Calendar Events/Items sections from newsletter PDFs to ICS."
@@ -260,8 +321,14 @@ def main() -> int:
         "input_dir",
         nargs="?",
         type=Path,
-        default=DEFAULT_INPUT_DIR,
-        help=f"Directory containing newsletter PDFs. Default: {DEFAULT_INPUT_DIR}",
+        help="Directory containing newsletter PDFs. Default: current working directory.",
+    )
+    parser.add_argument(
+        "-i",
+        "--input-dir",
+        dest="input_dir_option",
+        type=Path,
+        help="Directory containing newsletter PDFs. Overrides the positional folder.",
     )
     parser.add_argument(
         "-o",
@@ -280,17 +347,29 @@ def main() -> int:
         type=Path,
         help="Optional JSON file with the same parsed event details.",
     )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help=(
+            "Pause at each parsed event before writing the ICS so you can add extra "
+            "description details."
+        ),
+    )
     args = parser.parse_args()
 
-    pdfs = sorted(args.input_dir.glob("*.pdf"))
+    input_dir = selected_input_dir(args.input_dir, args.input_dir_option)
+    if not input_dir.is_dir():
+        raise SystemExit(f"Input path is not a directory: {input_dir}")
+
+    pdfs = sorted(input_dir.glob("*.pdf"))
     if not pdfs:
-        raise SystemExit(f"No PDF files found in {args.input_dir}")
+        raise SystemExit(f"No PDF files found in {input_dir}")
 
     events: list[CalendarEvent] = []
     for pdf_path in pdfs:
         events.extend(parse_calendar_events(pdf_path, args.timezone))
 
-    events = dedupe_events(events)
+    events = enrich_event_descriptions(dedupe_events(events), args.interactive)
     args.output.write_text(build_ics(events, args.timezone), encoding="utf-8")
     if args.json_output:
         payload = [event_to_dict(event) for event in sorted(events, key=lambda item: item.start)]
