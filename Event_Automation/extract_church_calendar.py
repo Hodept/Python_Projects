@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 DEFAULT_OUTPUT_FILE = Path(__file__).with_name("church_calendar.ics")
 DEFAULT_TIMEZONE = "America/Los_Angeles"
 DEFAULT_DURATION_MINUTES = 60
+DEFAULT_TBD_START_HOUR = 9
 HYPE_PREFIX = "Hype statement:"
 
 SECTION_RE = re.compile(r"^Calendar (?:Events|Items)\s*$", re.IGNORECASE)
@@ -31,6 +32,7 @@ TIME_RE = re.compile(
     r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)\b",
     re.IGNORECASE,
 )
+TBD_TIME_RE = re.compile(r"\btime\s*[,:-]?\s*TBD\b", re.IGNORECASE)
 YEAR_RE = re.compile(r"\b(20\d{2})\b")
 
 
@@ -113,12 +115,13 @@ def parse_time(text: str) -> tuple[int, int] | None:
 
 def split_event_text(text: str) -> tuple[str, str]:
     time_match = TIME_RE.search(text)
-    without_time = TIME_RE.sub("", text).strip(" ,")
+    tbd_time_match = TBD_TIME_RE.search(text)
+    without_time = TBD_TIME_RE.sub("", TIME_RE.sub("", text)).strip(" ,-")
     parts = [part.strip(" ,") for part in without_time.split(",") if part.strip(" ,")]
 
     if len(parts) >= 2:
         return ", ".join(parts[:-1]), parts[-1]
-    if time_match:
+    if time_match or tbd_time_match:
         return without_time, ""
     return text.strip(), ""
 
@@ -197,11 +200,12 @@ def parse_calendar_events(pdf_path: Path, timezone_name: str) -> list[CalendarEv
 
         raw_event = " ".join(current_event_parts)
         parsed_time = parse_time(raw_event)
-        if not parsed_time:
+        has_tbd_time = bool(TBD_TIME_RE.search(raw_event))
+        if not parsed_time and not has_tbd_time:
             current_event_parts = []
             return
 
-        hour, minute = parsed_time
+        hour, minute = parsed_time or (DEFAULT_TBD_START_HOUR, 0)
         start = current_date.replace(hour=hour, minute=minute)
         summary, location = split_event_text(raw_event)
         events.append(

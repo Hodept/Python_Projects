@@ -4,24 +4,16 @@ PRODID:-//Church Newsletter Calendar Extractor//EN
 CALSCALE:GREGORIAN
 METHOD:PUBLISH
 BEGIN:VEVENT
-UID:16ff6f8c31d8f05a@church-newsletter
-DTSTAMP:20260609T192258Z
-DTSTART;TZID=America/Los_Angeles:20260612T193000
-DTEND;TZID=America/Los_Angeles:20260612T203000
-SUMMARY:Ensign Symphony & Chorus presents "Americana"
-LOCATION:Benaroya Hall
-DESCRIPTION:Ensign Symphony & Chorus presents "Americana"\, Benaroya Hall\
- , 7:30pm\nSource: Weekly Newsletter - Week of June 7 2026.pdf
-END:VEVENT
-BEGIN:VEVENT
-UID:fdaf2cbe2707d73c@church-newsletter
-DTSTAMP:20260609T192258Z
-DTSTART;TZID=America/Los_Angeles:20260626T180000
-DTEND;TZID=America/Los_Angeles:20260626T190000
-SUMMARY:“Songs of Hope” Tabernacle Choir and Orchestra at Temple Square
-LOCATION:Stake Center
-DESCRIPTION:“Songs of Hope” Tabernacle Choir and Orchestra at Temple Squar
- e\, Stake Center\, 6:00pm\nSource: Weekly Newsletter - Week of June 7 2026
- .pdf
+UID:bd9da6cd85d3fed5@church-newsletter
+DTSTAMP:20260627T171418Z
+DTSTART;TZID=America/Los_Angeles:20260711T090000
+DTEND;TZID=America/Los_Angeles:20260711T100000
+SUMMARY:Ward BBQ - come celebrate the 250th birthday of the USA in the pav
+ ilion in the back field.
+DESCRIPTION:Hype statement: Come be part of Ward BBQ - come celebrate the 
+ 250th birthday of the USA in the pavilion in the back field - a meaningful
+  opportunity to gather\, connect\, and be uplifted.\n\nEvent details:\nWar
+ d BBQ - come celebrate the 250th birthday of the USA in the pavilion in th
+ e back field. Time\, TBD\nSource: Weekly Newsletter 2026-06-28.pdf
 END:VEVENT
 END:VCALENDAR
