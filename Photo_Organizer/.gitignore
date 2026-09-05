@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Private runtime data: paths, filenames, timestamps, and GPS coordinates.
+.photo-organizer-state/
+inventory.sqlite3*
+organizer.lock
+extracted/
+scan-report.json
+apply-log.jsonl
+plan.csv
+*.summary.json
+config.local.json

@@ -1,0 +1,18 @@
+{
+  "places": [
+    {
+      "name": "Vancouver",
+      "latitude": 49.2827,
+      "longitude": -123.1207,
+      "radius_km": 20
+    }
+  ],
+  "events": [
+    {
+      "name": "Our wedding",
+      "start": "2020-06-20T00:00:00",
+      "end": "2020-06-21T23:59:59",
+      "source_contains": "Wedding"
+    }
+  ]
+}
