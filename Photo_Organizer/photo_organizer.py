@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline, plan-first photo organization. Python 3.10+ and ExifTool."""
+"""Plan-first photo organization with optional geocoding. Python 3.10+ and ExifTool."""
 import argparse
 import csv
 from contextlib import contextmanager
@@ -16,14 +16,16 @@ import subprocess
 import sys
 import tarfile
 import uuid
+from itertools import product
 import zipfile
 from datetime import datetime, timedelta
 from functools import wraps
+import geocoding
 
 PHOTOS = set('.jpg .jpeg .heic .heif .png .tif .tiff .webp .avif .dng .cr2 .cr3 .nef .nrw .arw .orf .rw2 .raf .pef .srw .bmp .gif .jxl'.split())
 ARCHIVES = ('.zip', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz')
 UNSUPPORTED = ('.7z', '.rar', '.gz', '.bz2', '.xz', '.zst')
-FIELDS = ['source', 'destination', 'sha256', 'size', 'captured', 'date_source', 'latitude', 'longitude', 'event', 'place', 'duplicate_of', 'original_relative']
+FIELDS = ['source', 'destination', 'sha256', 'size', 'captured', 'date_source', 'latitude', 'longitude', 'event', 'place', 'duplicate_of', 'original_relative', 'grouping_basis', 'location_source', 'city', 'region', 'country']
 
 
 def within(path, root):
@@ -61,6 +63,7 @@ def connect(state):
         source TEXT, destination TEXT, sha256 TEXT, status TEXT,
         PRIMARY KEY (source, destination, sha256));
     ''')
+    geocoding.prepare_cache(db)
     return db
 
 
@@ -204,6 +207,10 @@ def scan(args):
     extractor = Extractor(state, int(args.max_expanded_gb * 1024**3), args.max_archive_members) if args.extract_archives else None
     pending = []
     counts = {'photos': 0, 'cached': 0, 'other_files': 0, 'archives': 0}
+    limit = getattr(args, 'max_photos', None)
+    if limit is not None and limit <= 0:
+        raise ValueError('--max-photos must be positive')
+    limited = False
 
     def flush():
         if not pending:
@@ -236,7 +243,11 @@ def scan(args):
         print(f"Scanned {counts['photos']} photos ({counts['cached']} cached)", file=sys.stderr)
 
     def visit(root, prefix='', depth=0):
+        nonlocal limited
         for p in walk(root, excluded if depth == 0 else [], lambda e: issue(db, run, root, e)):
+            if limit is not None and counts['photos'] >= limit:
+                limited = True
+                return
             rel = prefix + p.relative_to(root).as_posix()
             try:
                 if p.suffix.lower() in PHOTOS:
@@ -268,7 +279,7 @@ def scan(args):
     db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('run', run))
     db.commit()
     problems = [dict(r) for r in db.execute('SELECT source,problem FROM issues WHERE run=?', (run,))]
-    (state / 'scan-report.json').write_text(json.dumps({**counts, 'issues': problems}, indent=2))
+    (state / 'scan-report.json').write_text(json.dumps({**counts, 'partial_scan': limited, 'max_photos': limit, 'issues': problems}, indent=2))
     print(json.dumps({**counts, 'issues': len(problems)}))
     return 1 if problems else 0
 
@@ -320,6 +331,138 @@ def config_read(path):
     return cfg
 
 
+def geocoded_label(result):
+    if not result or result.get('status') != 'found':
+        return None
+    locality = result['locality']
+    if result['level'] != 'city':
+        locality = result['level'].title() + '-' + locality
+    parts = [locality, result.get('region'), result.get('country')]
+    # Bound UTF-8 lengths while retaining region/country disambiguation.
+    labels = []
+    for part in parts:
+        if part:
+            label = slug(part).encode('utf-8')[:40].decode('utf-8', errors='ignore')
+            if label not in labels:
+                labels.append(label)
+    return '_'.join(labels)
+
+
+@with_inventory
+def geocode(args):
+    db = args._db
+    setting = db.execute("SELECT value FROM settings WHERE key='run'").fetchone()
+    if not setting:
+        raise ValueError('run scan first')
+    points = {}
+    for row in db.execute('SELECT metadata FROM photos WHERE seen=?', (setting[0],)):
+        gps = coordinates(json.loads(row[0]))
+        if gps:
+            points.setdefault(geocoding.cache_key(gps, args.precision, args.language), gps)
+    pending = [gps for gps in points.values() if geocoding.get_cached(db, gps, args.precision, args.language) is None]
+    print(f'{len(points)} distinct rounded locations; {len(points)-len(pending)} cached; {len(pending)} API requests needed.')
+    if not args.fetch:
+        print('Preview only. Use --fetch to send rounded coordinates to Geoapify; no photos, paths, or timestamps are sent.')
+        return 0
+    if len(pending) > args.max_requests:
+        raise ValueError('lookup count exceeds --max-requests; increase it explicitly or use a smaller pilot')
+    if pending:
+        key = os.environ.get('GEOAPIFY_API_KEY', '').strip()
+        key_file = Path(args.state) / 'geoapify-key.txt'
+        if not key and key_file.is_file():
+            key = key_file.read_text().strip()
+        client = geocoding.GeoapifyClient(key, args.request_interval)
+        for i, gps in enumerate(pending, 1):
+            result = client.lookup(gps, args.precision, args.language)
+            geocoding.save_cached(db, gps, result, args.precision, args.language)
+            if i % 10 == 0 or i == len(pending):
+                print(f'Geocoded {i}/{len(pending)} locations', file=sys.stderr)
+    found = sum(geocoding.get_cached(db, gps, args.precision, args.language)['status'] == 'found' for gps in points.values())
+    report = {'provider': 'Geoapify', 'locations': len(points), 'resolved': found, 'not_found': len(points)-found,
+              'precision': args.precision, 'language': args.language, 'attribution': geocoding.ATTRIBUTION}
+    (Path(args.state) / 'geocoding-report.json').write_text(json.dumps(report, indent=2))
+    print(json.dumps(report))
+
+
+def source_album(relative, cfg):
+    parents = PurePosixPath(relative).parts[:-1]
+    for rule in cfg.get('source_albums', []):
+        match = rule['source_folder'].casefold().strip('/')
+        if match in (part.casefold() for part in parents) or '/'.join(parents).casefold().startswith(match + '/') or '/'.join(parents).casefold() == match:
+            return slug(rule.get('name', rule['source_folder'].split('/')[-1]))
+    ignored = {str(v).casefold() for v in cfg.get('ignore_source_folders', [])}
+    for part in parents:
+        lower = part.casefold().strip()
+        if lower in ignored or part.endswith('!'):
+            continue
+        if re.fullmatch(r'(archive|photos?|pictures?|images?|albums?|trips?|dcim|downloads?|exports?|takeout|unknown|untitled|originals?)', lower):
+            continue
+        if re.match(r'^(photos? from |camera\b|\d{3}apple\b)', lower):
+            continue
+        if re.fullmatch(r'[\d\s._-]+', lower):
+            continue
+        if re.fullmatch(r'(january|february|march|april|may|june|july|august|september|october|november|december)([\s_-]+\d{4})?', lower):
+            continue
+        return slug(part)
+    return None
+
+
+def broad_groups(photos, cfg, radius, use_source_context):
+    """Named albums first; remaining photos share year/location folders.
+
+    Spatial bins find fixed-radius anchors without all-pairs GPS comparisons.
+    Fixed anchors avoid chaining nearby points into an ever-growing region.
+    """
+    bins = {}
+    cell = 2 * math.sin(min(radius / 6371, math.pi) / 2)
+
+    def bin_key(gps):
+        lat, lon = map(math.radians, gps)
+        xyz = (math.cos(lat)*math.cos(lon), math.cos(lat)*math.sin(lon), math.sin(lat))
+        return tuple(math.floor(v / cell) for v in xyz)
+
+    for p in photos:
+        p['album'] = source_album(p['row']['relative'], cfg) if use_source_context else None
+    # Ignore timestamp order when establishing reproducible GPS anchors.
+    candidates = sorted((p for p in photos if p['gps'] and not p['event'] and not p['album'] and p['place'].startswith('GPS-')),
+                        key=lambda p: (*p['gps'], p['row']['source']))
+    labels = set()
+    for p in candidates:
+        key = bin_key(p['gps'])
+        nearby = []
+        for delta in product((-1, 0, 1), repeat=3):
+            for anchor, label in bins.get(tuple(a+b for a,b in zip(key, delta)), []):
+                distance = km(p['gps'], anchor)
+                if distance <= radius:
+                    nearby.append((distance, label))
+        if nearby:
+            label = min(nearby)[1]
+        else:
+            base = f'Location-to-review-{len(labels)+1:05d}'
+            label, n = base, 1
+            while label in labels:
+                n += 1
+                label = f'{base}-{n}'
+            labels.add(label)
+            bins.setdefault(key, []).append((p['gps'], label))
+        p['place'] = label
+    for p in photos:
+        year = str(p['dt'].year) if p['dt'] else 'Unknown-date'
+        if p['event']:
+            name, date, _ = p['event']
+            folder = Path('Events') / (date + '_' + name)
+            basis = 'named-event'
+        elif p['album']:
+            name = p['album']
+            folder = Path('Albums') / name
+            basis = 'source-album'
+        else:
+            name = 'Location-to-review' if p['place'].startswith('GPS-') else p['place']
+            folder = Path(year) / name
+            basis = 'year-location' if p['gps'] else 'year-only'
+        p['broad_folder'], p['broad_name'], p['basis'] = folder, name, basis
+
+
 @with_inventory
 def plan(args):
     state = Path(args.state).resolve()
@@ -338,11 +481,20 @@ def plan(args):
         dt, origin = captured(meta)
         gps = coordinates(meta)
         place = 'Unknown-location'
+        location_source, resolved = 'missing', None
         if gps:
             place = f'GPS-{gps[0]:.2f}_{gps[1]:.2f}'
+            location_source = 'gps'
+            if getattr(args, 'use_geocoding', True):
+                resolved = geocoding.get_cached(db, gps, getattr(args, 'geocode_precision', 2), getattr(args, 'language', 'en'))
+                label = geocoded_label(resolved)
+                if label:
+                    place = slug(cfg.get('place_aliases', {}).get(label)) if label in cfg.get('place_aliases', {}) else label
+                    location_source = 'geocoding-cache'
             for p in cfg.get('places', []):
                 if km(gps, (p['latitude'], p['longitude'])) <= p.get('radius_km', 10):
                     place = slug(p['name'])
+                    location_source = 'configured-place'
                     break
         local = dt.replace(tzinfo=None) if dt else None
         event = None
@@ -356,8 +508,12 @@ def plan(args):
                         continue
                     event = (slug(e['name']), e['start'][:10], slug(e.get('place', place)))
                     break
-        photos.append({'row': row, 'dt': dt, 'local': local, 'origin': origin, 'gps': gps, 'place': place, 'event': event})
+        photos.append({'row': row, 'dt': dt, 'local': local, 'origin': origin, 'gps': gps, 'place': place, 'event': event,
+                       'location_source': location_source, 'resolved': resolved or {}})
     photos.sort(key=lambda p: (p['local'] or datetime.max, p['row']['source']))
+    grouping = getattr(args, 'grouping', 'broad')
+    if grouping == 'broad':
+        broad_groups(photos, cfg, getattr(args, 'location_radius_km', 20), not getattr(args, 'ignore_source_context', False))
     previous = anchor = last_gps = None
     group = 0
     group_info = {}
@@ -388,12 +544,19 @@ def plan(args):
         writer.writeheader()
         for p in photos:
             row, dt = p['row'], p['dt']
-            if dt:
+            if grouping == 'broad':
+                folder, name = p['broad_folder'], p['broad_name']
+                base = (dt.strftime('%Y-%m-%d_%H-%M-%S') if dt else slug(Path(row['relative']).stem)) + '_' + slug(name)
+            elif dt:
                 name, date, folder_place = p['event'] or group_info[p['group']]
+                if folder_place.startswith('GPS-'):
+                    folder_place = 'Location-to-review'
                 folder = Path(date[:4]) / (date + '_' + name + '_' + folder_place)
                 base = dt.strftime('%Y-%m-%d_%H-%M-%S') + '_' + name + '_' + folder_place
             else:
                 name, folder_place = 'Unknown-date', p['place']
+                if folder_place.startswith('GPS-'):
+                    folder_place = 'Location-to-review'
                 folder = Path('Unknown-date') / folder_place
                 base = slug(Path(row['relative']).stem)
             if args.preserve_folders:
@@ -411,9 +574,12 @@ def plan(args):
             gps = p['gps'] or ('', '')
             writer.writerow(dict(source=row['source'], destination=destination, sha256=row['sha256'], size=row['size'],
                                  captured=dt.isoformat() if dt else '', date_source=p['origin'], latitude=gps[0], longitude=gps[1],
-                                 event=name, place=p['place'], duplicate_of=first if first != destination else '', original_relative=row['relative']))
+                                 event=name, place=p['place'], duplicate_of=first if first != destination else '', original_relative=row['relative'],
+                                 grouping_basis=p.get('basis', 'time-event'), location_source=p['location_source'],
+                                 city=p['resolved'].get('city', ''), region=p['resolved'].get('region', ''), country=p['resolved'].get('country', '')))
             events[str(folder)] = events.get(str(folder), 0) + 1
-    outpath.with_suffix('.summary.json').write_text(json.dumps({'destination': str(library_root), 'photos': len(photos), 'exact_duplicates': len(photos)-len(duplicates), 'folders': events}, indent=2))
+    outpath.with_suffix('.summary.json').write_text(json.dumps({'destination': str(library_root), 'grouping': grouping, 'photos': len(photos), 'exact_duplicates': len(photos)-len(duplicates), 'folders': events,
+        'geocoding': {'enabled': getattr(args, 'use_geocoding', True), 'resolved_photos': sum(p['resolved'].get('status') == 'found' for p in photos), 'attribution': geocoding.ATTRIBUTION if getattr(args, 'use_geocoding', True) else None}}, indent=2))
     print(f'Wrote {len(photos)} photo operations to {outpath}. No source photos changed.')
 
 
@@ -577,12 +743,27 @@ def main():
     p.add_argument('--max-archive-members', type=int, default=100000)
     p.add_argument('--max-archive-depth', type=int, default=3)
     p.add_argument('--refresh', action='store_true', help='reread metadata and checksums even for unchanged file stats')
+    p.add_argument('--max-photos', type=int, help='limit the scan to this many photos for a pilot; naming rules are unchanged')
     p.set_defaults(func=scan)
+    p = sub.add_parser('geocode', help='preview or fetch cached city names for inventoried GPS coordinates')
+    p.add_argument('--state', required=True)
+    p.add_argument('--fetch', action='store_true')
+    p.add_argument('--precision', type=int, choices=(2, 3, 4), default=2)
+    p.add_argument('--language', default='en')
+    p.add_argument('--max-requests', type=int, default=200)
+    p.add_argument('--request-interval', type=positive, default=1.1)
+    p.set_defaults(func=geocode)
     p = sub.add_parser('plan', help='write a reviewable CSV; no media writes')
     p.add_argument('--state', required=True)
     p.add_argument('--output', required=True)
     p.add_argument('--destination', required=True, help='new library folder to create after approval')
     p.add_argument('--config')
+    p.add_argument('--use-geocoding', action=argparse.BooleanOptionalAction, default=True, help='use cached city names by default; never makes network requests')
+    p.add_argument('--geocode-precision', type=int, choices=(2, 3, 4), default=2)
+    p.add_argument('--language', default='en')
+    p.add_argument('--grouping', choices=('broad', 'events'), default='broad', help='broad source albums and year/location folders (default), or short time events')
+    p.add_argument('--location-radius-km', type=positive, default=20, help='radius around each GPS area anchor in broad mode')
+    p.add_argument('--ignore-source-context', action='store_true', help='do not use source folders as album context')
     p.add_argument('--gap-hours', type=positive, default=6)
     p.add_argument('--max-event-hours', type=positive, default=36)
     p.add_argument('--distance-km', type=positive, default=30)

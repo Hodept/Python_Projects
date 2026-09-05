@@ -14,5 +14,16 @@
       "end": "2020-06-21T23:59:59",
       "source_contains": "Wedding"
     }
-  ]
+  ],
+  "source_albums": [
+    {
+      "source_folder": "Summer trip",
+      "name": "Summer trip"
+    }
+  ],
+  "ignore_source_folders": [
+    "Unsorted",
+    "Phone backup"
+  ],
+  "place_aliases": {}
 }

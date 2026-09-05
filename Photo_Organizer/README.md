@@ -1,6 +1,6 @@
 # Photo Organizer
 
-A photo-first, offline organizer for local folders and mounted network storage on Windows, macOS, or Linux. It recursively inventories photos, optionally expands archives into local staging, reads capture times and GPS, proposes event folders and descriptive filenames, then moves photos into a new library only after explicit approval. Each move copies and verifies the destination before deleting the source photo. Archives remain intact.
+A photo-first organizer that runs offline by default for local folders and mounted network storage on Windows, macOS, or Linux. It recursively inventories photos, optionally expands archives into local staging, reads capture times and GPS, proposes contextual album folders, broad location folders, and descriptive filenames, then moves photos into a new library only after explicit approval. Each move copies and verifies the destination before deleting the source photo. Archives remain intact.
 
 ## Requirements
 
@@ -12,7 +12,7 @@ A photo-first, offline organizer for local folders and mounted network storage o
 
 Run commands from the project directory. `SOURCE_DIRECTORY` and `DESTINATION_DIRECTORY` below are placeholders: replace them with your own source and destination paths. The source can be a local folder, mounted network share, or mapped drive accessible to the current user. The destination must be outside the source tree.
 
-The example `.photo-organizer-state` is a private working directory relative to the current directory; you can choose a different local directory using `--state`. Use a separate state directory for a pilot and the full collection. Commands are on single lines so they can be used in common shells without platform-specific line continuations.
+The example `.photo-organizer-state` is a private working directory relative to the current directory; you can choose a different local directory using `--state`. Use a separate state directory for a pilot and the full collection. Add `--max-photos 600` to `scan` for a quick pilot; it saves a partial inventory in traversal order and leaves naming unchanged. The scan report records the limit. This is not a random sample; omit the option to scan the full source. Commands are on single lines so they can be used in common shells without platform-specific line continuations.
 
 ```text
 python photo_organizer.py scan "SOURCE_DIRECTORY" --state ".photo-organizer-state" --extract-archives
@@ -41,22 +41,32 @@ Photos extracted from archives are copied from staging; both the extraction cach
 
 ## Folder and filename design
 
-With a named event and known place:
+The default `--grouping broad` uses this priority:
+
+1. Explicitly named events from configuration stay together.
+2. Meaningful source albums stay together across dates and cities, including photos without dates or GPS.
+3. Other photos share year/location folders. Time gaps do not split these folders.
 
 ```text
 OrganizedPhotos/
-  2020/
-    2020-06-20_Our-wedding_Vancouver/
-      2020-06-20_15-04-22_Our-wedding_Vancouver_a94d9f620231.jpg
+  Albums/
+    Summer-trip/
+      2020-06-20_15-04-22_Summer-trip_a94d9f620231.jpg
+  Events/
+    2020-06-20_Our-wedding/
   2024/
-    2024-08-14_Event-00012_GPS-48.43_-123.37/
-      2024-08-14_09-30-00_Event-00012_GPS-48.43_-123.37_41a7081dd038.heic
+    Vancouver/
+    Seattle_Washington_United-States/
+    Unknown-location/
   Unknown-date/
     Unknown-location/
-      old-family-photo_2bd810610116.jpg
 ```
 
-A year-first tree stays predictable across decades; event folders include their date and place. The timestamp orders photos within an event, the label adds context, and a short content hash prevents same-second camera collisions. Additional suffixes preserve repeated copies. The CSV records the original path, full checksum, timestamp source, GPS, event, and destination. `duplicate_of` flags byte-identical photos; duplicates are not deleted or collapsed. Edited images and RAW/JPEG pairs are separate files.
+Generic source folders such as `Archive`, `Photos from 2013`, date-only names, camera folders, and month/year folders do not become albums automatically. The first meaningful parent beneath the scanned source root supplies album context, so nested date folders do not break up a trip. This is a name-based heuristic, not semantic understanding. Matching album labels merge even if they occur under different branches; configure distinct names if those are separate collections.
+
+For remaining photos, configured named places take priority, followed by cached city/region/country names (enabled by default). If a name has not been resolved, photos are placed in clearly labelled `Location-to-review-00001` groups instead of coordinate-named folders. These unresolved groups use a 20 km radius around a fixed anchor, adjustable with `--location-radius-km`. A point must be within that radius of the anchor: chains of nearby points do not keep expanding the area. This approximates local areas rather than administrative city boundaries. Photos in one area share a folder within each year; albums can span multiple years. Missing GPS falls back to the year’s `Unknown-location`, and missing dates to `Unknown-date`, unless album or named-event context supplies a group.
+
+The CSV records the grouping reason in `grouping_basis`, original path, full checksum, timestamp source, GPS, label, and destination. Exact GPS remains in the CSV even when the folder represents a broad area or album. `duplicate_of` flags byte-identical photos; duplicates are retained as separate destination files. Edited images and RAW/JPEG pairs are separate files. Timestamps order filenames, labels add context, and short content hashes plus collision suffixes distinguish files.
 
 ## Naming events and places
 
@@ -66,13 +76,42 @@ Copy `config.example.json` to `config.local.json` and replace the sample values.
 python photo_organizer.py plan --state ".photo-organizer-state" --config "config.local.json" --destination "DESTINATION_DIRECTORY" --output ".photo-organizer-state/plan.csv"
 ```
 
-- `places`: name, latitude, longitude, and optional `radius_km` (default 10). The first matching place wins. Without a match, GPS is shown as coordinates; no coordinates are sent to a geocoding service.
+- `places`: name, latitude, longitude, and optional `radius_km` (default 10). The first matching place wins. Without a match, cached API city names are used when enabled, otherwise location-review labels are used. No coordinates leave the computer unless you explicitly run the geocoding fetch step.
 - `events`: name, inclusive local `start` and `end`. A named range can group a wedding across several days. Optional `source_contains` limits it to matching original paths; remove it to match all photos in that time range. Optional `place` restricts matching to that configured place. First matching event wins.
-- Automatic groups split after a six-hour gap, after 36 hours from the group start, or when consecutive known GPS positions differ by over 30 km. Adjust with `--gap-hours`, `--max-event-hours`, and `--distance-km` on `plan`.
-- `--preserve-folders` on `plan` includes the original parent hierarchy underneath each event folder.
+- `source_albums`: optional `source_folder` and `name` mappings to explicitly keep a source album together or rename it. Match a folder component or relative parent path; first match wins.
+- `ignore_source_folders`: names to treat as generic containers rather than albums. Explicit `source_albums` rules take priority.
+- `--ignore-source-context` disables source-album grouping for a location-only pass.
+- `--grouping events` restores the earlier fine-grained time grouping: split after a six-hour gap, 36 hours from the group start, or a GPS change over 30 km. Adjust with `--gap-hours`, `--max-event-hours`, and `--distance-km`. These three options affect event mode only; broad mode uses `--location-radius-km` instead.
+- `--preserve-folders` includes the original parent hierarchy underneath each proposed folder. This can increase folder count; leave it off for broad organization.
 - For specific adjustments, edit **only destination paths** in the CSV before applying; paths must be relative to the library, unique, and free of traversal. Use a CSV editor that preserves the other fields. You can remove rows to apply a subset. Changing the `event` column alone does not rename destinations.
 
-Automatic groups are suggestions, not semantic recognition. A long wedding with no photos overnight can split; unrelated cameras used at the same time can merge when GPS is absent. Photos without GPS may share an event's location in their proposed folder, but the CSV retains their missing GPS and `Unknown-location` value. Group numbers can change when photos or rules change, so keep the reviewed plan when resuming. Applying a different plan into an existing library can create additional copies; it is not a synchronization engine.
+Group suggestions are not semantic recognition. Review source album choices and add ignore rules for generic folders with unusual names. In event mode, a long wedding with no photos overnight can split, and unrelated cameras used at the same time can merge when GPS is absent. In broad mode, repeated visits to the same area within a year are intentionally combined. Album context does not invent missing GPS or timestamps.
+
+Keep the reviewed plan when resuming: area anchors and event numbers can change when photos or rules change. Applying a different plan into an existing library can create additional copies; this is not a synchronization engine.
+
+## Optional city names from a reverse-geocoding API
+
+Geoapify can resolve coordinates into city, region, and country fields. The separate `geocode` step caches results in the local inventory. Scanning, planning, and applying never make network requests.
+
+1. Obtain a key from [Geoapify](https://www.geoapify.com/).
+2. Set `GEOAPIFY_API_KEY` in the environment of the process running the script, or save only the key in `geoapify-key.txt` inside your chosen state directory. The program does not load `.env` files automatically. Keep credentials out of the public repository.
+3. Preview the number of API calls, then fetch and regenerate a plan:
+
+```text
+python photo_organizer.py geocode --state ".photo-organizer-state"
+python photo_organizer.py geocode --state ".photo-organizer-state" --fetch
+python photo_organizer.py plan --state ".photo-organizer-state" --destination "DESTINATION_DIRECTORY" --output ".photo-organizer-state/plan-city.csv"
+```
+
+Only rounded coordinates and request options are sent to Geoapify; photos, paths, filenames, and timestamps remain local. The [city-level reverse-geocoding endpoint](https://apidocs.geoapify.com/docs/geocoding/reverse-geocoding/) returns location information without requiring street-level folder names. A two-decimal coordinate cache is the default (approximately 1.1 km in latitude; longitude distance varies). Nearby coordinates in the same rounded cell reuse a lookup. Cells near municipal boundaries can receive an adjacent city's label; use `--precision 3` or `4` when fetching and the matching `--geocode-precision` when planning if greater precision is needed. This increases the number of requests. `--language` defaults to `en` and must match in both commands.
+
+The default cap is 200 uncached lookups per invocation, with at least one second between requests. `--max-requests` and `--request-interval` can be adjusted for your provider plan. The cap is checked before requests begin. Authentication, quota, and network failures stop the run; completed results remain cached for the next run. Empty results are cached too. Repeating a completed fetch needs no API calls. Results and attribution are saved locally; request URLs and API keys are not logged. Provider quotas or charges depend on your account.
+
+Planning automatically uses cached city/region/country names and groups matching labels within each year; no extra flag is needed. `--no-use-geocoding` explicitly disables cache use. Named events and source albums still take priority, so a two-city trip album stays together. Missing cache entries or unresolved locations use `Location-to-review` groups; photos without GPS still use source context or year-only grouping. The CSV includes `location_source`, `city`, `region`, and `country` for review. County, region, or country fallbacks are explicitly labelled rather than presented as cities.
+
+Optional `place_aliases` in your configuration map the complete generated place label to a preferred metro-area label. For example, mapping both `Example-City_Example-Region_Example-Country` and `Nearby-Town_Example-Region_Example-Country` to `Example metro area` combines them. Copy the exact labels from the CSV after the first city-name plan. Configured radius-based `places` override API labels. Text similarity alone is not used to merge places, since different places may share names.
+
+Attribution: Powered by [Geoapify](https://www.geoapify.com/), with data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright). Attribution is also included in the geocoding report and plan summary when enabled. This implementation does not use the public Nominatim service.
 
 ## Metadata and formats
 
@@ -102,7 +141,7 @@ Apply reads each source to check that it still matches the inventory, copies it,
 
 Publish the source, tests, documentation, and example configuration. Runtime inventories, plans, reports, logs, and personal configuration are private: they contain absolute file paths and may contain filenames, photo timestamps, and GPS coordinates. Absolute paths are needed locally for reliable transfers; they are not hardcoded in the program.
 
-The included `.gitignore` excludes the default state directory, Python caches, SQLite inventories, generated plan/report/log filenames, and `config.local.json`. Keep custom-named runtime output outside the repository or add it to your own ignore rules. Git ignore rules do not remove files that were already tracked or erase Git history; inspect the files staged for publication. The checked-in example configuration contains fictional event information and public example coordinates.
+The included `.gitignore` excludes the default state directory, Python caches, SQLite inventories, generated plan/report/log filenames, , `config.local.json`, credential files, and environment files. Keep custom-named runtime output outside the repository or add it to your own ignore rules. Git ignore rules do not remove files that were already tracked or erase Git history; inspect the files staged for publication. The checked-in example configuration contains fictional event information and public example coordinates.
 
 ## Validation and extension
 
@@ -110,6 +149,6 @@ The included `.gitignore` excludes the default state directory, Python caches, S
 python -m unittest discover -s tests -v
 ```
 
-Tests cover approval, verified moves, transfer recovery, destination matching, nested archive scanning, traversal and link rejection, expansion bounds, incremental inventory, metadata dates, event splitting, explicit labels, missing metadata, duplicates, checksum failures, collision refusal, and resume behavior. Metadata extraction is mocked in automated tests; validate the installed ExifTool against a pilot containing actual camera/phone formats before the full NAS run.
+Tests cover geocoding response parsing, coordinate caching, throttling, credential-safe errors, offline previews, city grouping, broad GPS grouping, fixed-radius boundaries, source-album context across cities and dates, configuration overrides, approval, verified moves, transfer recovery, destination matching, nested archive scanning, traversal and link rejection, expansion bounds, incremental inventory, metadata dates, event splitting, explicit labels, missing metadata, duplicates, checksum failures, collision refusal, and resume behavior. Metadata extraction is mocked in automated tests; validate the installed ExifTool against a pilot containing actual camera/phone formats before the full NAS run.
 
 The stages are separate so later document/video organizers can reuse the inventory, review-plan, and verified-copy approach with the same explicit approval and transfer verification workflow.

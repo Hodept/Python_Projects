@@ -14,3 +14,7 @@ apply-log.jsonl
 plan.csv
 *.summary.json
 config.local.json
+geoapify-key.txt
+geocoding-report.json
+.env
+.env.*

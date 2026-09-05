@@ -38,11 +38,11 @@ class OrganizerTests(unittest.TestCase):
         with patch.object(app.shutil, 'which', return_value='/mock/exiftool'), patch.object(app, 'metadata_batch', side_effect=metadata):
             app.scan(argparse.Namespace(**args))
 
-    def plan(self, config=None):
+    def plan(self, config=None, grouping='events', **options):
         app.plan(argparse.Namespace(state=str(self.state), output=str(self.output),
                                    destination=str(self.dest),
                                    config=config, gap_hours=6, max_event_hours=36,
-                                   distance_km=30, preserve_folders=False))
+                                   distance_km=30, preserve_folders=False, grouping=grouping, **options))
         with self.output.open() as f:
             return list(csv.DictReader(f))
 
@@ -184,6 +184,15 @@ class OrganizerTests(unittest.TestCase):
                     pass
         self.assertFalse((self.state / 'organizer.lock').exists())
 
+    def test_pilot_scan_limit_saves_reviewable_inventory(self):
+        for name in 'abc':
+            (self.source / f'{name}.jpg').write_bytes(name.encode())
+        self.scan(max_photos=2)
+        self.assertEqual(len(self.plan()), 2)
+        report = json.loads((self.state / 'scan-report.json').read_text())
+        self.assertTrue(report['partial_scan'])
+        self.assertEqual(report['max_photos'], 2)
+
     def test_failed_copy_cleanup_and_resume(self):
         (self.source / 'a.jpg').write_bytes(b'original')
         self.scan()
@@ -255,6 +264,72 @@ class OrganizerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.apply(mode='move')
         self.assertTrue((self.source / 'a.jpg').exists())
+
+    def test_broad_album_spans_dates_cities_and_missing_metadata(self):
+        album = self.source / 'Two-city trip'
+        album.mkdir()
+        for name in 'abc':
+            (album / f'{name}.jpg').write_bytes(name.encode())
+        self.scan()
+        with app.connect(self.state) as db:
+            db.execute('UPDATE photos SET metadata=? WHERE source=?', (json.dumps({'DateTimeOriginal': '2021:01:02 10:00:00', 'GPSLatitude': 40.7, 'GPSLongitude': -74}), str(album / 'b.jpg')))
+            db.execute('UPDATE photos SET metadata=? WHERE source=?', ('{}', str(album / 'c.jpg')))
+        db.close()
+        rows = self.plan(grouping='broad')
+        self.assertEqual({str(Path(r['destination']).parent) for r in rows}, {'Albums/Two-city-trip'})
+        self.assertEqual({r['grouping_basis'] for r in rows}, {'source-album'})
+
+    def test_broad_nearby_gps_merges_despite_time_gaps(self):
+        archive = self.source / 'Archive'
+        archive.mkdir()
+        for name in 'abc':
+            (archive / f'{name}.jpg').write_bytes(name.encode())
+        self.scan()
+        with app.connect(self.state) as db:
+            for name, date, lat in [('a', '2020:01:01', 49.0), ('b', '2020:08:01', 49.08), ('c', '2020:08:02', 51.0)]:
+                meta = {'DateTimeOriginal': date+' 10:00:00', 'GPSLatitude': lat, 'GPSLongitude': -123}
+                db.execute('UPDATE photos SET metadata=? WHERE source=?', (json.dumps(meta), str(archive / f'{name}.jpg')))
+        db.close()
+        rows = self.plan(grouping='broad')
+        self.assertEqual(Path(rows[0]['destination']).parent, Path(rows[1]['destination']).parent)
+        self.assertNotEqual(Path(rows[1]['destination']).parent, Path(rows[2]['destination']).parent)
+        self.assertTrue(all('Location-to-review-' in r['destination'] for r in rows))
+        self.assertTrue(all('GPS-' not in r['destination'] and 'Area-' not in r['destination'] for r in rows))
+
+    def test_source_context_rules(self):
+        self.assertIsNone(app.source_album('Archive/Photos from 2013/a.jpg', {}))
+        self.assertEqual(app.source_album('Trips/Two-city trip/2013/a.jpg', {}), 'Two-city-trip')
+        self.assertIsNone(app.source_album('Camera, by someone/a.jpg', {}))
+        self.assertIsNone(app.source_album('Unsorted/a.jpg', {'ignore_source_folders':['Unsorted']}))
+        self.assertEqual(app.source_album('Archive/a.jpg', {'source_albums':[{'source_folder':'Archive','name':'Family history'}]}), 'Family-history')
+
+    def test_broad_fixed_anchor_does_not_chain_and_handles_dateline(self):
+        def photo(lat, lon, name):
+            return {'gps': (lat,lon), 'place': 'GPS-test', 'event': None, 'dt': None, 'row': {'relative': name+'.jpg', 'source': name}}
+        photos = [photo(0, 0, 'a'),photo(0, .15, 'b'),photo(0, .30, 'c')]
+        app.broad_groups(photos, {}, 20, False)
+        self.assertEqual(photos[0]['place'],photos[1]['place'])
+        self.assertNotEqual(photos[1]['place'],photos[2]['place'])
+        photos = [photo(0, 179.95, 'a'),photo(0, -179.95, 'b')]
+        app.broad_groups(photos, {}, 20, False)
+        self.assertEqual(photos[0]['place'],photos[1]['place'])
+
+    def test_cached_cities_group_and_source_album_stays_intact(self):
+        import geocoding
+        album = self.source / 'Two-city trip'
+        album.mkdir()
+        for path, data in [(self.source/'a.jpg',b'a'),(self.source/'b.jpg',b'b'),(album/'c.jpg',b'c')]:
+            path.write_bytes(data)
+        self.scan()
+        db=app.connect(self.state)
+        geocoding.save_cached(db,(49.28,-123.12),geocoding.normalize({'results':[{'city':'Example City','state':'Example Region','country':'Example Country'}]}))
+        db.close()
+        rows=self.plan(grouping='broad')
+        root_rows=[r for r in rows if r['grouping_basis']!='source-album']
+        self.assertEqual(len({str(Path(r['destination']).parent) for r in root_rows}),1)
+        self.assertTrue(all(r['city']=='Example City' for r in rows))
+        self.assertTrue(all('Example-City' in r['destination'] for r in root_rows))
+        self.assertTrue(any(r['destination'].startswith('Albums/Two-city-trip/') for r in rows))
 
 
 if __name__ == '__main__':
