@@ -73,7 +73,7 @@ Here is how to read the first example command:
 | `"SOURCE_DIRECTORY"` | Your source-folder path |
 | `--state ".photo-organizer-state"` | Uses your chosen private working directory |
 | `--destination "DESTINATION_DIRECTORY"` | Records where the organized library will be created after approval |
-| `--extract-archives` | Enables supported archive extraction; this flag has no separate value |
+| `--no-extract-archives` | Optional switch that disables the default archive extraction |
 | `--max-photos 600` | Stops after 600 photos for a pilot |
 
 ## 1. Start with a pilot
@@ -81,7 +81,7 @@ Here is how to read the first example command:
 Test the workflow on a limited number of photos before scanning the full collection:
 
 ```text
-python photo_organizer.py prepare "SOURCE_DIRECTORY" --state ".photo-organizer-state" --destination "DESTINATION_DIRECTORY" --extract-archives --max-photos 600
+python photo_organizer.py prepare "SOURCE_DIRECTORY" --state ".photo-organizer-state" --destination "DESTINATION_DIRECTORY" --max-photos 600
 ```
 
 This command:
@@ -89,7 +89,7 @@ This command:
 - walks the source folder and its subfolders;
 - reads photo metadata and calculates a full SHA-256 hash;
 - resolves new GPS locations into readable place names and caches the results;
-- expands supported archives into private staging when `--extract-archives` is present;
+- expands supported archives into private staging, including archives nested up to 10 levels deep;
 - stops after 600 photos and records that the inventory is partial;
 - creates `.photo-organizer-state/plan.csv` and its summary automatically;
 - leaves every source file unchanged.
@@ -150,7 +150,7 @@ Folders use readable labels such as `Seattle_Washington_United-States`. An unres
 The default two-decimal cache groups coordinates into cells roughly 1.1 km high; east-west distance varies by latitude. To make preparation more precise:
 
 ```text
-python photo_organizer.py prepare "SOURCE_DIRECTORY" --state ".photo-organizer-state" --destination "DESTINATION_DIRECTORY" --extract-archives --max-photos 600 --geocode-precision 3
+python photo_organizer.py prepare "SOURCE_DIRECTORY" --state ".photo-organizer-state" --destination "DESTINATION_DIRECTORY" --max-photos 600 --geocode-precision 3
 ```
 
 Greater precision creates more API requests. Preparation allows up to 200 new requests by default. Increase this explicitly with `--max-geocode-requests` when appropriate for your provider plan. The standalone `geocode` command uses `--max-requests`.
@@ -194,7 +194,7 @@ Photos extracted from archives are copied from staging even in move mode. Origin
 Once the pilot looks right, use a new subdirectory inside the private state directory and omit `--max-photos`:
 
 ```text
-python photo_organizer.py prepare "SOURCE_DIRECTORY" --state ".photo-organizer-state/full" --destination "DESTINATION_DIRECTORY" --extract-archives
+python photo_organizer.py prepare "SOURCE_DIRECTORY" --state ".photo-organizer-state/full" --destination "DESTINATION_DIRECTORY"
 ```
 
 Repeat the review and preview steps before running an approved transfer.
@@ -208,7 +208,7 @@ The normal workflow uses `prepare` and `apply`. Separate `scan` and `plan` comma
 Refresh only the inventory and location cache:
 
 ```text
-python photo_organizer.py scan "SOURCE_DIRECTORY" --state ".photo-organizer-state" --extract-archives
+python photo_organizer.py scan "SOURCE_DIRECTORY" --state ".photo-organizer-state"
 ```
 
 Create or replace a plan from that saved inventory:
@@ -276,13 +276,13 @@ Configuration sections:
 
 Supported photos include JPEG, HEIC/HEIF, PNG, TIFF, WebP, AVIF, GIF, BMP, JXL, DNG, and common camera RAW formats.
 
-ZIP and TAR archives—including gzip, bzip2, and xz-compressed TAR files—can be expanded with `--extract-archives`. Nested archives are supported to three levels by default. Safety limits default to 20 GiB of expanded content and 100,000 archive members:
+ZIP and TAR archives—including gzip, bzip2, and xz-compressed TAR files—are expanded by default. Nested archives are supported to 10 levels. Safety limits default to 20 GiB of expanded content and 100,000 archive members:
 
 ```text
-python photo_organizer.py prepare "SOURCE_DIRECTORY" --state ".photo-organizer-state" --destination "DESTINATION_DIRECTORY" --extract-archives --max-expanded-gb 50 --max-archive-members 200000 --max-archive-depth 4
+python photo_organizer.py prepare "SOURCE_DIRECTORY" --state ".photo-organizer-state" --destination "DESTINATION_DIRECTORY" --max-expanded-gb 50 --max-archive-members 200000 --max-archive-depth 10
 ```
 
-Unsafe paths, links, special files, corrupt archives, and limit violations are reported without extracting incomplete content. Password-protected archives, RAR, 7z, and standalone compressed streams must be unpacked separately.
+Use `--no-extract-archives` when archives should be skipped. Unsafe paths, links, special files, corrupt archives, and limit violations are reported without extracting incomplete content. Password-protected archives, RAR, 7z, and standalone compressed streams must be unpacked separately.
 
 Videos, documents, external XMP/AAE sidecars, Google Takeout JSON, and Live Photo video companions are not organized in this photo phase. In move mode, a still photo may move while its external companion remains in the source tree. Use copy mode when those relationships need to remain intact.
 

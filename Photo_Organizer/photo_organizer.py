@@ -813,10 +813,11 @@ def add_scan_arguments(parser):
     parser.add_argument('source')
     parser.add_argument('--state', required=True, help='local working directory, preferably not on NAS')
     parser.add_argument('--exclude', action='append', default=[])
-    parser.add_argument('--extract-archives', action='store_true')
+    parser.add_argument('--extract-archives', action=argparse.BooleanOptionalAction, default=True,
+                        help='expand supported archives (default); use --no-extract-archives to skip them')
     parser.add_argument('--max-expanded-gb', type=positive, default=20)
     parser.add_argument('--max-archive-members', type=int, default=100000)
-    parser.add_argument('--max-archive-depth', type=int, default=3)
+    parser.add_argument('--max-archive-depth', type=int, default=10)
     parser.add_argument('--refresh', action='store_true', help='reread metadata and checksums even for unchanged file stats')
     parser.add_argument('--max-photos', type=int, help='limit the scan to this many photos for a pilot; naming rules are unchanged')
     parser.add_argument('--geocoding', action=argparse.BooleanOptionalAction, default=True,
@@ -866,14 +867,14 @@ def state_lock(state):
         lock.unlink()
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('prepare', help='scan, resolve locations, and create a review plan; no media writes')
     add_scan_arguments(p)
     add_plan_arguments(p, include_state=False, output_required=False, include_location_cache_options=False)
     p.set_defaults(func=prepare)
-    p = sub.add_parser('scan', help='inventory photos, resolve GPS locations, and optionally expand archives')
+    p = sub.add_parser('scan', help='inventory photos, resolve GPS locations, and expand supported archives')
     add_scan_arguments(p)
     p.set_defaults(func=scan)
     p = sub.add_parser('geocode', help='preview or fetch cached city names for inventoried GPS coordinates')
@@ -894,6 +895,11 @@ def main():
     p.add_argument('--mode', choices=('move', 'copy'), default='move')
     p.add_argument('--approve', action='store_true', help='approve execution of the reviewed plan; otherwise preview only')
     p.set_defaults(func=apply)
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
     try:
         with state_lock(Path(args.state).resolve()):

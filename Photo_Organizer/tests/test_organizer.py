@@ -211,6 +211,15 @@ class OrganizerTests(unittest.TestCase):
                     pass
         self.assertFalse((self.state / 'organizer.lock').exists())
 
+    def test_archive_extraction_command_defaults(self):
+        parser = app.build_parser()
+        base = ['prepare', str(self.source), '--state', str(self.state), '--destination', str(self.dest)]
+        args = parser.parse_args(base)
+        self.assertTrue(args.extract_archives)
+        self.assertEqual(args.max_archive_depth, 10)
+        args = parser.parse_args([*base, '--no-extract-archives'])
+        self.assertFalse(args.extract_archives)
+
     def test_pilot_scan_limit_saves_reviewable_inventory(self):
         for name in 'abc':
             (self.source / f'{name}.jpg').write_bytes(name.encode())
