@@ -124,10 +124,10 @@ You may remove rows to process only part of the plan. You may also edit values i
 
 Geolocation is part of `prepare` by default. After the local inventory is safely committed, preparation sends rounded coordinates to Geoapify and caches the returned city, region, and country. Photos, filenames, paths, and timestamps remain local.
 
-The preparation output and `scan-report.json` show whether location lookup completed. A network, credential, quota, or request-limit error does not discard the photo inventory or prevent the initial plan from being written. Fix the cause and resume only the lookup step:
+The preparation output and `scan-report.json` show whether location lookup completed. A network, credential, or quota error does not discard the photo inventory or prevent the initial plan from being written. Fix the cause and resume only the lookup step:
 
 ```text
-python photo_organizer.py geocode --state ".photo-organizer-state" --fetch
+python photo_organizer.py geocode --state ".photo-organizer-state" --fetch --max-requests 100
 ```
 
 To see how many lookups remain without making an API call, omit `--fetch`:
@@ -136,7 +136,9 @@ To see how many lookups remain without making an API call, omit `--fetch`:
 python photo_organizer.py geocode --state ".photo-organizer-state"
 ```
 
-Results are cached, so repeated preparation and lookup retries only request locations that are not already stored. Planning uses cached names automatically and never performs network requests.
+`--max-requests 100` processes at most 100 uncached locations during that run. If more remain, the command reports `partial` and records `requests_remaining`. Run the same command again later; every successful result is committed immediately, and only uncached locations are requested. Once the preview reports zero requests needed, all available lookup work is complete.
+
+Results are cached, so repeated preparation and lookup retries do not request locations that are already stored. Planning uses cached names automatically and never performs network requests.
 
 Regenerate the plan after geocoding without rescanning the NAS:
 
@@ -152,7 +154,7 @@ The default two-decimal cache groups coordinates into cells roughly 1.1 km high;
 python photo_organizer.py prepare "SOURCE_DIRECTORY" --state ".photo-organizer-state" --destination "DESTINATION_DIRECTORY" --max-photos 600 --geocode-precision 3
 ```
 
-Greater precision creates more API requests. Preparation allows up to 200 new requests by default. Increase this explicitly with `--max-geocode-requests` when appropriate for your provider plan. The standalone `geocode` command uses `--max-requests`.
+Greater precision creates more API requests. Preparation processes up to 200 new requests by default and writes a usable plan with the results available at that point. Use `--max-geocode-requests` to select a different preparation batch size. The standalone `geocode` command uses `--max-requests` and can be rerun over time.
 
 For completely offline preparation, add `--no-geocoding`. The plan will use previously cached names when available and `Location-to-review` labels for unresolved GPS areas. Add `--no-use-geocoding` if cached names should also be ignored.
 

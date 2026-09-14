@@ -95,6 +95,35 @@ class GeocodingTests(unittest.TestCase):
                 client.assert_not_called()
             db.close()
 
+    def test_geocoding_runs_in_persistent_batches(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            db = app.connect(state)
+            try:
+                run = 'sample'
+                db.execute('INSERT INTO settings VALUES (?,?)', ('run', run))
+                for index, latitude in enumerate((40.01, 41.01, 42.01)):
+                    metadata = json.dumps({'GPSLatitude': latitude, 'GPSLongitude': -123.01})
+                    db.execute('INSERT INTO photos VALUES (?,?,?,?,?,?,?)',
+                               (f'photo-{index}', f'photo-{index}', 1, 1, f'hash-{index}', metadata, run))
+                db.commit()
+                result = geocoding.normalize({'results': [{'city': 'Example'}]})
+                with patch.dict('os.environ', {'GEOAPIFY_API_KEY': 'test-key'}), \
+                     patch.object(geocoding, 'GeoapifyClient') as client:
+                    client.return_value.lookup.return_value = result
+                    first = app.geocode_inventory(db, state, run, 2, 'en', 2, 1.1, True)
+                    self.assertEqual(first['status'], 'partial')
+                    self.assertEqual(first['new_requests'], 2)
+                    self.assertEqual(first['requests_remaining'], 1)
+                    second = app.geocode_inventory(db, state, run, 2, 'en', 2, 1.1, True)
+                    self.assertEqual(second['status'], 'complete')
+                    self.assertEqual(second['new_requests'], 1)
+                    self.assertEqual(second['requests_remaining'], 0)
+                    self.assertEqual(client.return_value.lookup.call_count, 3)
+                self.assertEqual(db.execute('SELECT count(*) FROM geocodes').fetchone()[0], 3)
+            finally:
+                db.close()
+
     def test_scan_geocodes_by_default_and_records_result(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

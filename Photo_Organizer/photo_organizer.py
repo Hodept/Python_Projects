@@ -394,33 +394,41 @@ def geocoded_label(result):
 
 
 def geocode_inventory(db, state, run, precision, language, max_requests, request_interval, fetch):
+    if max_requests <= 0:
+        raise ValueError('geocoding request limit must be positive')
     points = {}
     for row in db.execute('SELECT metadata FROM photos WHERE seen=?', (run,)):
         gps = coordinates(json.loads(row[0]))
         if gps:
             points.setdefault(geocoding.cache_key(gps, precision, language), gps)
-    pending = [gps for gps in points.values() if geocoding.get_cached(db, gps, precision, language) is None]
+    pending = [points[key] for key in sorted(points)
+               if geocoding.get_cached(db, points[key], precision, language) is None]
     print(f'{len(points)} distinct rounded locations; {len(points)-len(pending)} cached; {len(pending)} API requests needed.')
     if not fetch:
         return {'enabled': True, 'status': 'preview', 'locations': len(points), 'cached': len(points)-len(pending),
                 'requests_needed': len(pending), 'precision': precision, 'language': language,
                 'attribution': geocoding.ATTRIBUTION}
-    if len(pending) > max_requests:
-        raise ValueError('lookup count exceeds the request limit; increase the geocoding request limit explicitly or use a smaller pilot')
-    if pending:
+    batch = pending[:max_requests]
+    if batch:
         key = os.environ.get('GEOAPIFY_API_KEY', '').strip()
         key_file = Path(state) / 'geoapify-key.txt'
         if not key and key_file.is_file():
             key = key_file.read_text().strip()
         client = geocoding.GeoapifyClient(key, request_interval)
-        for i, gps in enumerate(pending, 1):
+        for i, gps in enumerate(batch, 1):
             result = client.lookup(gps, precision, language)
             geocoding.save_cached(db, gps, result, precision, language)
-            if i % 10 == 0 or i == len(pending):
-                print(f'Geocoded {i}/{len(pending)} locations', file=sys.stderr)
-    found = sum(geocoding.get_cached(db, gps, precision, language)['status'] == 'found' for gps in points.values())
-    report = {'enabled': True, 'status': 'complete', 'provider': 'Geoapify', 'locations': len(points),
-              'resolved': found, 'not_found': len(points)-found, 'new_requests': len(pending),
+            if i % 10 == 0 or i == len(batch):
+                print(f'Geocoded {i}/{len(batch)} locations in this batch', file=sys.stderr)
+    results = [geocoding.get_cached(db, gps, precision, language) for gps in points.values()]
+    cached = sum(result is not None for result in results)
+    found = sum(bool(result and result['status'] == 'found') for result in results)
+    not_found = sum(bool(result and result['status'] == 'not-found') for result in results)
+    remaining = len(points) - cached
+    status = 'complete' if remaining == 0 else 'partial'
+    report = {'enabled': True, 'status': status, 'provider': 'Geoapify', 'locations': len(points),
+              'cached': cached, 'resolved': found, 'not_found': not_found,
+              'new_requests': len(batch), 'requests_remaining': remaining,
               'precision': precision, 'language': language, 'attribution': geocoding.ATTRIBUTION}
     (Path(state) / 'geocoding-report.json').write_text(json.dumps(report, indent=2))
     return report
