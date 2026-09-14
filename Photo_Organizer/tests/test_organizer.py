@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import csv
 import io
 import json
@@ -30,7 +31,8 @@ class OrganizerTests(unittest.TestCase):
     def scan(self, **overrides):
         args = dict(source=str(self.source), state=str(self.state), exclude=[],
                     extract_archives=True, max_expanded_gb=1,
-                    max_archive_members=100, max_archive_depth=3, refresh=False)
+                    max_archive_members=100, max_archive_depth=3, refresh=False,
+                    geocoding=False)
         args.update(overrides)
         def metadata(paths):
             return {str(p): {'DateTimeOriginal': '2020:06:20 15:00:00',
@@ -106,12 +108,19 @@ class OrganizerTests(unittest.TestCase):
         (self.source / 'a.jpg').write_bytes(b'same-content')
         (self.source / 'b.jpg').write_bytes(b'same-content')
         self.scan()
-        rows = self.plan()
-        self.assertEqual(sum(bool(r['duplicate_of']) for r in rows), 1)
-        self.assertNotEqual(rows[0]['destination'], rows[1]['destination'])
+        console = io.StringIO()
+        with contextlib.redirect_stdout(console):
+            rows = self.plan()
+        self.assertIn('Plan summary: 1 destination file, 1 exact duplicate excluded', console.getvalue())
+        self.assertEqual(len(rows), 1)
+        with self.output.with_name('plan.duplicates.csv').open() as handle:
+            duplicate_rows = list(csv.DictReader(handle))
+        self.assertEqual(len(duplicate_rows), 1)
+        self.assertEqual(duplicate_rows[0]['kept_source'], str(self.source / 'a.jpg'))
+        self.assertEqual(duplicate_rows[0]['source'], str(self.source / 'b.jpg'))
         self.assertEqual(self.apply(), 0)
         self.assertEqual(self.apply(), 0)
-        self.assertEqual(len(list(self.dest.rglob('*.jpg'))), 2)
+        self.assertEqual(len(list(self.dest.rglob('*.jpg'))), 1)
         (self.source / 'a.jpg').write_bytes(b'changed')
         self.assertEqual(self.apply(), 1)
         self.assertEqual((self.dest / rows[0]['destination']).read_bytes(), b'same-content')
@@ -125,6 +134,24 @@ class OrganizerTests(unittest.TestCase):
         target.write_bytes(b'unrelated')
         self.assertEqual(self.apply(), 1)
         self.assertEqual(target.read_bytes(), b'unrelated')
+
+    def test_apply_rejects_legacy_plan_containing_duplicate_content(self):
+        first, second = self.source / 'a.jpg', self.source / 'b.jpg'
+        first.write_bytes(b'same-content')
+        second.write_bytes(b'same-content')
+        self.scan()
+        row = self.plan()[0]
+        legacy_duplicate = dict(row)
+        legacy_duplicate['source'] = str(second)
+        legacy_duplicate['original_relative'] = second.name
+        legacy_duplicate['destination'] = 'legacy/second.jpg'
+        with self.output.open('w', newline='') as handle:
+            writer = csv.DictWriter(handle, fieldnames=app.FIELDS)
+            writer.writeheader()
+            writer.writerows((row, legacy_duplicate))
+        with self.assertRaisesRegex(ValueError, 'exact duplicate content'):
+            self.apply()
+        self.assertFalse(self.dest.exists())
 
     def test_manifest_traversal_rejected_before_copy(self):
         (self.source / 'a.jpg').write_bytes(b'original')
@@ -192,6 +219,88 @@ class OrganizerTests(unittest.TestCase):
         report = json.loads((self.state / 'scan-report.json').read_text())
         self.assertTrue(report['partial_scan'])
         self.assertEqual(report['max_photos'], 2)
+
+    def test_prepare_creates_default_plan_and_apply_uses_saved_settings(self):
+        photo = self.source / 'a.jpg'
+        photo.write_bytes(b'original')
+        args = argparse.Namespace(
+            source=str(self.source), state=str(self.state), destination=str(self.dest), output=None,
+            exclude=[], extract_archives=False, max_expanded_gb=1, max_archive_members=100,
+            max_archive_depth=1, refresh=False, max_photos=None, geocoding=False,
+            geocode_precision=2, language='en', max_geocode_requests=10,
+            geocode_request_interval=0.01, config=None, use_geocoding=True,
+            grouping='broad', location_radius_km=20, ignore_source_context=False,
+            gap_hours=6, max_event_hours=36, distance_km=30, preserve_folders=False)
+        metadata = {str(photo): {'DateTimeOriginal': '2020:01:01 10:00:00'}}
+        with patch.object(app.shutil, 'which', return_value='/mock/exiftool'), \
+             patch.object(app, 'metadata_batch', return_value=metadata):
+            self.assertEqual(app.prepare(args), 0)
+        plan_path = self.state / 'plan.csv'
+        self.assertTrue(plan_path.exists())
+        self.assertTrue(plan_path.with_suffix('.summary.json').exists())
+        apply_args = argparse.Namespace(state=str(self.state), plan=None, destination=None,
+                                        mode='copy', approve=False)
+        self.assertEqual(app.apply(apply_args), 0)
+        self.assertFalse(self.dest.exists())
+        apply_args.approve = True
+        self.assertEqual(app.apply(apply_args), 0)
+        self.assertEqual(len(list(self.dest.rglob('*.jpg'))), 1)
+
+    def test_prepare_writes_plan_for_successful_photos_when_another_photo_fails(self):
+        good, bad = self.source / 'good.jpg', self.source / 'bad.jpg'
+        good.write_bytes(b'good')
+        bad.write_bytes(b'bad')
+        args = argparse.Namespace(
+            source=str(self.source), state=str(self.state), destination=str(self.dest), output=None,
+            exclude=[], extract_archives=False, max_expanded_gb=1, max_archive_members=100,
+            max_archive_depth=1, refresh=False, max_photos=None, geocoding=False,
+            geocode_precision=2, language='en', max_geocode_requests=10,
+            geocode_request_interval=0.01, config=None, use_geocoding=True,
+            grouping='broad', location_radius_km=20, ignore_source_context=False,
+            gap_hours=6, max_event_hours=36, distance_km=30, preserve_folders=False)
+        metadata = {
+            str(good): {'DateTimeOriginal': '2020:01:01 10:00:00'},
+            str(bad): {'Error': 'unreadable photo'},
+        }
+        with patch.object(app.shutil, 'which', return_value='/mock/exiftool'), \
+             patch.object(app, 'metadata_batch', return_value=metadata):
+            self.assertEqual(app.prepare(args), 1)
+        with (self.state / 'plan.csv').open() as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual([row['source'] for row in rows], [str(good)])
+
+    def test_minor_metadata_warning_is_recorded_without_console_noise(self):
+        photo = self.source / 'a.jpg'
+        photo.write_bytes(b'a')
+        metadata = {str(photo): {'DateTimeOriginal': '2020:01:01 10:00:00',
+                                 'Warning': '[minor] Example camera metadata warning'}}
+        args = argparse.Namespace(source=str(self.source), state=str(self.state), exclude=[],
+                                  extract_archives=False, max_expanded_gb=1,
+                                  max_archive_members=100, max_archive_depth=1,
+                                  refresh=False, max_photos=None, geocoding=False)
+        console = io.StringIO()
+        with patch.object(app.shutil, 'which', return_value='/mock/exiftool'), \
+             patch.object(app, 'metadata_batch', return_value=metadata), \
+             contextlib.redirect_stderr(console):
+            self.assertEqual(app.scan(args), 0)
+        self.assertNotIn('Example camera metadata warning', console.getvalue())
+        report = json.loads((self.state / 'scan-report.json').read_text())
+        self.assertEqual(len(report['warnings']), 1)
+        self.assertEqual(report['errors'], [])
+
+    def test_existing_issue_table_is_migrated_with_severity(self):
+        database = self.state / 'inventory.sqlite3'
+        with contextlib.closing(sqlite3.connect(database)) as db:
+            db.execute('CREATE TABLE issues (run TEXT, source TEXT, problem TEXT)')
+            db.execute("INSERT INTO issues VALUES ('old','photo.jpg','old issue')")
+            db.commit()
+        db = app.connect(self.state)
+        try:
+            columns = {row[1] for row in db.execute('PRAGMA table_info(issues)')}
+            self.assertIn('severity', columns)
+            self.assertEqual(db.execute('SELECT severity FROM issues').fetchone()[0], 'error')
+        finally:
+            db.close()
 
     def test_failed_copy_cleanup_and_resume(self):
         (self.source / 'a.jpg').write_bytes(b'original')
@@ -278,6 +387,26 @@ class OrganizerTests(unittest.TestCase):
         rows = self.plan(grouping='broad')
         self.assertEqual({str(Path(r['destination']).parent) for r in rows}, {'Albums/Two-city-trip'})
         self.assertEqual({r['grouping_basis'] for r in rows}, {'source-album'})
+
+    def test_photos_without_gps_use_calendar_month_and_missing_dates_keep_context(self):
+        album = self.source / 'Family archive'
+        album.mkdir()
+        for name in 'abc':
+            (album / f'{name}.jpg').write_bytes(name.encode())
+        self.scan()
+        with contextlib.closing(app.connect(self.state)) as db:
+            db.execute('UPDATE photos SET metadata=? WHERE source=?',
+                       (json.dumps({'DateTimeOriginal': '2020:01:02 10:00:00'}), str(album / 'a.jpg')))
+            db.execute('UPDATE photos SET metadata=? WHERE source=?',
+                       (json.dumps({'DateTimeOriginal': '2020:02:03 10:00:00'}), str(album / 'b.jpg')))
+            db.execute('UPDATE photos SET metadata=? WHERE source=?', ('{}', str(album / 'c.jpg')))
+            db.commit()
+        rows = self.plan(grouping='broad')
+        by_name = {Path(row['source']).name: row for row in rows}
+        self.assertEqual(Path(by_name['a.jpg']['destination']).parent, Path('2020/01-January'))
+        self.assertEqual(Path(by_name['b.jpg']['destination']).parent, Path('2020/02-February'))
+        self.assertEqual(by_name['a.jpg']['grouping_basis'], 'calendar-month')
+        self.assertEqual(Path(by_name['c.jpg']['destination']).parent, Path('Albums/Family-archive'))
 
     def test_broad_nearby_gps_merges_despite_time_gaps(self):
         archive = self.source / 'Archive'

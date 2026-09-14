@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan-first photo organization with optional geocoding. Python 3.10+ and ExifTool."""
+"""Two-stage photo organization with readable GPS locations. Python 3.10+ and ExifTool."""
 import argparse
 import csv
 from contextlib import contextmanager
@@ -63,6 +63,9 @@ def connect(state):
         source TEXT, destination TEXT, sha256 TEXT, status TEXT,
         PRIMARY KEY (source, destination, sha256));
     ''')
+    issue_columns = {row[1] for row in db.execute('PRAGMA table_info(issues)')}
+    if 'severity' not in issue_columns:
+        db.execute("ALTER TABLE issues ADD COLUMN severity TEXT NOT NULL DEFAULT 'error'")
     geocoding.prepare_cache(db)
     return db
 
@@ -79,9 +82,16 @@ def with_inventory(function):
     return wrapped
 
 
-def issue(db, run, path, error):
-    db.execute('INSERT INTO issues VALUES (?,?,?)', (run, str(path), str(error)))
-    print(f'Issue: {path}: {error}', file=sys.stderr)
+def issue(db, run, path, error, severity='error', display=True):
+    db.execute('INSERT INTO issues (run,source,problem,severity) VALUES (?,?,?,?)',
+               (run, str(path), str(error), severity))
+    if display:
+        label = 'Warning' if severity == 'warning' else 'Error'
+        print(f'{label}: {path}: {error}', file=sys.stderr)
+
+
+def minor_warning(message):
+    return bool(re.match(r'^\s*\[minor\]', str(message), flags=re.IGNORECASE))
 
 
 def walk(root, excluded, on_error):
@@ -235,7 +245,8 @@ def scan(args):
                 db.execute('INSERT OR REPLACE INTO photos VALUES (?,?,?,?,?,?,?)',
                            (str(p), rel, after.st_size, after.st_mtime_ns, sha, json.dumps(meta), run))
                 if meta.get('Warning'):
-                    issue(db, run, p, meta['Warning'])
+                    warning = meta['Warning']
+                    issue(db, run, p, warning, severity='warning', display=not minor_warning(warning))
             except Exception as e:
                 issue(db, run, p, e)
         pending.clear()
@@ -278,10 +289,30 @@ def scan(args):
     db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('source', str(source)))
     db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('run', run))
     db.commit()
-    problems = [dict(r) for r in db.execute('SELECT source,problem FROM issues WHERE run=?', (run,))]
-    (state / 'scan-report.json').write_text(json.dumps({**counts, 'partial_scan': limited, 'max_photos': limit, 'issues': problems}, indent=2))
-    print(json.dumps({**counts, 'issues': len(problems)}))
-    return 1 if problems else 0
+    geocoding_failed = False
+    geocoding_report = {'enabled': False, 'status': 'disabled'}
+    if getattr(args, 'geocoding', False):
+        try:
+            geocoding_report = geocode_inventory(
+                db, state, run, args.geocode_precision, args.language,
+                args.max_geocode_requests, args.geocode_request_interval, fetch=True)
+        except (ValueError, OSError) as e:
+            geocoding_failed = True
+            geocoding_report = {'enabled': True, 'status': 'error', 'error': str(e)}
+            print(f'Geocoding incomplete: {e}', file=sys.stderr)
+    warnings = [dict(r) for r in db.execute("SELECT source,problem FROM issues WHERE run=? AND severity='warning'", (run,))]
+    errors = [dict(r) for r in db.execute("SELECT source,problem FROM issues WHERE run=? AND severity='error'", (run,))]
+    (state / 'scan-report.json').write_text(json.dumps({**counts, 'partial_scan': limited, 'max_photos': limit,
+                                                        'geocoding': geocoding_report,
+                                                        'warnings': warnings, 'errors': errors}, indent=2))
+    print(f"Scan complete: {counts['photos']} photos ({counts['cached']} reused), "
+          f"{counts['archives']} archives, {counts['other_files']} other files.")
+    print(f"Geocoding: {geocoding_report['status']}.")
+    if warnings:
+        print(f'{len(warnings)} metadata warnings were recorded in {state / "scan-report.json"}.')
+    if errors:
+        print(f'{len(errors)} scan errors were recorded in {state / "scan-report.json"}.')
+    return 2 if geocoding_failed else 1 if errors else 0
 
 
 def captured(meta):
@@ -348,39 +379,49 @@ def geocoded_label(result):
     return '_'.join(labels)
 
 
+def geocode_inventory(db, state, run, precision, language, max_requests, request_interval, fetch):
+    points = {}
+    for row in db.execute('SELECT metadata FROM photos WHERE seen=?', (run,)):
+        gps = coordinates(json.loads(row[0]))
+        if gps:
+            points.setdefault(geocoding.cache_key(gps, precision, language), gps)
+    pending = [gps for gps in points.values() if geocoding.get_cached(db, gps, precision, language) is None]
+    print(f'{len(points)} distinct rounded locations; {len(points)-len(pending)} cached; {len(pending)} API requests needed.')
+    if not fetch:
+        return {'enabled': True, 'status': 'preview', 'locations': len(points), 'cached': len(points)-len(pending),
+                'requests_needed': len(pending), 'precision': precision, 'language': language,
+                'attribution': geocoding.ATTRIBUTION}
+    if len(pending) > max_requests:
+        raise ValueError('lookup count exceeds the request limit; increase the geocoding request limit explicitly or use a smaller pilot')
+    if pending:
+        key = os.environ.get('GEOAPIFY_API_KEY', '').strip()
+        key_file = Path(state) / 'geoapify-key.txt'
+        if not key and key_file.is_file():
+            key = key_file.read_text().strip()
+        client = geocoding.GeoapifyClient(key, request_interval)
+        for i, gps in enumerate(pending, 1):
+            result = client.lookup(gps, precision, language)
+            geocoding.save_cached(db, gps, result, precision, language)
+            if i % 10 == 0 or i == len(pending):
+                print(f'Geocoded {i}/{len(pending)} locations', file=sys.stderr)
+    found = sum(geocoding.get_cached(db, gps, precision, language)['status'] == 'found' for gps in points.values())
+    report = {'enabled': True, 'status': 'complete', 'provider': 'Geoapify', 'locations': len(points),
+              'resolved': found, 'not_found': len(points)-found, 'new_requests': len(pending),
+              'precision': precision, 'language': language, 'attribution': geocoding.ATTRIBUTION}
+    (Path(state) / 'geocoding-report.json').write_text(json.dumps(report, indent=2))
+    return report
+
+
 @with_inventory
 def geocode(args):
     db = args._db
     setting = db.execute("SELECT value FROM settings WHERE key='run'").fetchone()
     if not setting:
-        raise ValueError('run scan first')
-    points = {}
-    for row in db.execute('SELECT metadata FROM photos WHERE seen=?', (setting[0],)):
-        gps = coordinates(json.loads(row[0]))
-        if gps:
-            points.setdefault(geocoding.cache_key(gps, args.precision, args.language), gps)
-    pending = [gps for gps in points.values() if geocoding.get_cached(db, gps, args.precision, args.language) is None]
-    print(f'{len(points)} distinct rounded locations; {len(points)-len(pending)} cached; {len(pending)} API requests needed.')
+        raise ValueError('run prepare or scan first')
+    report = geocode_inventory(db, Path(args.state), setting[0], args.precision, args.language,
+                               args.max_requests, args.request_interval, args.fetch)
     if not args.fetch:
         print('Preview only. Use --fetch to send rounded coordinates to Geoapify; no photos, paths, or timestamps are sent.')
-        return 0
-    if len(pending) > args.max_requests:
-        raise ValueError('lookup count exceeds --max-requests; increase it explicitly or use a smaller pilot')
-    if pending:
-        key = os.environ.get('GEOAPIFY_API_KEY', '').strip()
-        key_file = Path(args.state) / 'geoapify-key.txt'
-        if not key and key_file.is_file():
-            key = key_file.read_text().strip()
-        client = geocoding.GeoapifyClient(key, args.request_interval)
-        for i, gps in enumerate(pending, 1):
-            result = client.lookup(gps, args.precision, args.language)
-            geocoding.save_cached(db, gps, result, args.precision, args.language)
-            if i % 10 == 0 or i == len(pending):
-                print(f'Geocoded {i}/{len(pending)} locations', file=sys.stderr)
-    found = sum(geocoding.get_cached(db, gps, args.precision, args.language)['status'] == 'found' for gps in points.values())
-    report = {'provider': 'Geoapify', 'locations': len(points), 'resolved': found, 'not_found': len(points)-found,
-              'precision': args.precision, 'language': args.language, 'attribution': geocoding.ATTRIBUTION}
-    (Path(args.state) / 'geocoding-report.json').write_text(json.dumps(report, indent=2))
     print(json.dumps(report))
 
 
@@ -452,6 +493,10 @@ def broad_groups(photos, cfg, radius, use_source_context):
             name, date, _ = p['event']
             folder = Path('Events') / (date + '_' + name)
             basis = 'named-event'
+        elif not p['gps'] and p['dt']:
+            name = p['dt'].strftime('%m-%B')
+            folder = Path(year) / name
+            basis = 'calendar-month'
         elif p['album']:
             name = p['album']
             folder = Path('Albums') / name
@@ -469,7 +514,7 @@ def plan(args):
     db = args._db
     setting = db.execute("SELECT value FROM settings WHERE key='run'").fetchone()
     if not setting:
-        raise ValueError('run scan first')
+        raise ValueError('run prepare or scan first')
     library_root = Path(args.destination).resolve()
     source_root = Path(db.execute("SELECT value FROM settings WHERE key='source'").fetchone()[0])
     validate_library(library_root, source_root, state)
@@ -511,6 +556,23 @@ def plan(args):
         photos.append({'row': row, 'dt': dt, 'local': local, 'origin': origin, 'gps': gps, 'place': place, 'event': event,
                        'location_source': location_source, 'resolved': resolved or {}})
     photos.sort(key=lambda p: (p['local'] or datetime.max, p['row']['source']))
+    inventory_photos = len(photos)
+    kept_by_hash, duplicate_photos, unique_photos = {}, [], []
+    for photo in photos:
+        checksum = photo['row']['sha256']
+        kept = kept_by_hash.get(checksum)
+        if kept is None:
+            kept_by_hash[checksum] = photo
+            unique_photos.append(photo)
+        else:
+            duplicate_photos.append({
+                'source': photo['row']['source'],
+                'kept_source': kept['row']['source'],
+                'sha256': checksum,
+                'size': photo['row']['size'],
+                'original_relative': photo['row']['relative'],
+            })
+    photos = unique_photos
     grouping = getattr(args, 'grouping', 'broad')
     if grouping == 'broad':
         broad_groups(photos, cfg, getattr(args, 'location_radius_km', 20), not getattr(args, 'ignore_source_context', False))
@@ -538,7 +600,12 @@ def plan(args):
         previous = dt
     outpath = Path(args.output).resolve()
     outpath.parent.mkdir(parents=True, exist_ok=True)
-    duplicates, events, used = {}, {}, set()
+    duplicates_path = outpath.with_name(outpath.stem + '.duplicates.csv')
+    with duplicates_path.open('w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=('source', 'kept_source', 'sha256', 'size', 'original_relative'))
+        writer.writeheader()
+        writer.writerows(duplicate_photos)
+    events, used = {}, set()
     with outpath.open('w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=FIELDS)
         writer.writeheader()
@@ -570,17 +637,35 @@ def plan(args):
                 suffix += 1
                 destination = (folder / (base + f'_{suffix}' + ext)).as_posix()
             used.add(destination.casefold())
-            first = duplicates.setdefault(row['sha256'], destination)
             gps = p['gps'] or ('', '')
             writer.writerow(dict(source=row['source'], destination=destination, sha256=row['sha256'], size=row['size'],
                                  captured=dt.isoformat() if dt else '', date_source=p['origin'], latitude=gps[0], longitude=gps[1],
-                                 event=name, place=p['place'], duplicate_of=first if first != destination else '', original_relative=row['relative'],
+                                 event=name, place=p['place'], duplicate_of='', original_relative=row['relative'],
                                  grouping_basis=p.get('basis', 'time-event'), location_source=p['location_source'],
                                  city=p['resolved'].get('city', ''), region=p['resolved'].get('region', ''), country=p['resolved'].get('country', '')))
             events[str(folder)] = events.get(str(folder), 0) + 1
-    outpath.with_suffix('.summary.json').write_text(json.dumps({'destination': str(library_root), 'grouping': grouping, 'photos': len(photos), 'exact_duplicates': len(photos)-len(duplicates), 'folders': events,
+    exact_duplicates = len(duplicate_photos)
+    outpath.with_suffix('.summary.json').write_text(json.dumps({'destination': str(library_root), 'grouping': grouping,
+        'inventory_photos': inventory_photos, 'photos': len(photos), 'exact_duplicates': exact_duplicates,
+        'duplicate_policy': 'exclude', 'duplicates_report': str(duplicates_path), 'folders': events,
         'geocoding': {'enabled': getattr(args, 'use_geocoding', True), 'resolved_photos': sum(p['resolved'].get('status') == 'found' for p in photos), 'attribution': geocoding.ATTRIBUTION if getattr(args, 'use_geocoding', True) else None}}, indent=2))
     print(f'Wrote {len(photos)} photo operations to {outpath}. No source photos changed.')
+    file_word = 'file' if len(photos) == 1 else 'files'
+    duplicate_word = 'duplicate' if exact_duplicates == 1 else 'duplicates'
+    folder_word = 'folder' if len(events) == 1 else 'folders'
+    print(f'Plan summary: {len(photos)} destination {file_word}, {exact_duplicates} exact {duplicate_word} excluded, across {len(events)} {folder_word}.')
+    print(f'Duplicate details were written to {duplicates_path}. Duplicate source files were not changed.')
+
+
+def prepare(args):
+    """Inventory the source and create its review plan in one preparation stage."""
+    if not getattr(args, 'output', None):
+        args.output = str(Path(args.state).resolve() / 'plan.csv')
+    scan_status = scan(args) or 0
+    plan(args)
+    result = 'Preparation complete.' if scan_status == 0 else 'Preparation finished with issues recorded in the state directory.'
+    print(f'{result} Review {Path(args.output).resolve()} before applying it.')
+    return scan_status
 
 
 def validate_library(destination, source, state):
@@ -594,17 +679,23 @@ def apply(args):
     db = args._db
     setting = db.execute("SELECT value FROM settings WHERE key='source'").fetchone()
     if not setting:
-        raise ValueError('run scan first')
+        raise ValueError('run prepare or scan first')
     source_root = Path(setting[0])
-    target_root = Path(args.destination).resolve()
+    plan_path = Path(args.plan).resolve() if getattr(args, 'plan', None) else state / 'plan.csv'
+    summary = json.loads(plan_path.with_suffix('.summary.json').read_text())
+    planned_destination = summary.get('destination')
+    destination = getattr(args, 'destination', None) or planned_destination
+    if not destination:
+        raise ValueError('the plan summary does not contain a destination; supply --destination or regenerate the plan')
+    target_root = Path(destination).resolve()
     validate_library(target_root, source_root, state)
-    summary = json.loads(Path(args.plan).with_suffix('.summary.json').read_text())
-    if summary.get('destination') != str(target_root):
+    if planned_destination != str(target_root):
         raise ValueError('destination differs from the plan; regenerate the plan for this destination')
-    with Path(args.plan).open(newline='', encoding='utf-8-sig') as f:
+    with plan_path.open(newline='', encoding='utf-8-sig') as f:
         rows = list(csv.DictReader(f))
     destinations = set()
     sources = set()
+    hashes = set()
     # Validate the entire reviewed manifest before writing any photo.
     for row in rows:
         src = Path(row['source'])
@@ -618,6 +709,9 @@ def apply(args):
         known = db.execute('SELECT sha256,size FROM photos WHERE source=?', (str(src),)).fetchone()
         if not known or known['sha256'] != row['sha256'] or str(known['size']) != row['size']:
             raise ValueError(f'plan does not match inventory: {src}')
+        if row['sha256'] in hashes:
+            raise ValueError('plan contains exact duplicate content; regenerate it with the current planner')
+        hashes.add(row['sha256'])
         rel = safe_member(row['destination'])
         dst = target_root.joinpath(*rel.parts)
         if not within(dst.resolve(), target_root) or dst == target_root:
@@ -715,6 +809,47 @@ def positive(value):
     return v
 
 
+def add_scan_arguments(parser):
+    parser.add_argument('source')
+    parser.add_argument('--state', required=True, help='local working directory, preferably not on NAS')
+    parser.add_argument('--exclude', action='append', default=[])
+    parser.add_argument('--extract-archives', action='store_true')
+    parser.add_argument('--max-expanded-gb', type=positive, default=20)
+    parser.add_argument('--max-archive-members', type=int, default=100000)
+    parser.add_argument('--max-archive-depth', type=int, default=3)
+    parser.add_argument('--refresh', action='store_true', help='reread metadata and checksums even for unchanged file stats')
+    parser.add_argument('--max-photos', type=int, help='limit the scan to this many photos for a pilot; naming rules are unchanged')
+    parser.add_argument('--geocoding', action=argparse.BooleanOptionalAction, default=True,
+                        help='resolve new GPS locations with Geoapify (default); use --no-geocoding for an offline scan')
+    parser.add_argument('--geocode-precision', type=int, choices=(2, 3, 4), default=2)
+    parser.add_argument('--language', default='en')
+    parser.add_argument('--max-geocode-requests', type=int, default=200)
+    parser.add_argument('--geocode-request-interval', type=positive, default=1.1)
+
+
+def add_plan_arguments(parser, include_state=True, output_required=True, include_location_cache_options=True):
+    if include_state:
+        parser.add_argument('--state', required=True)
+    parser.add_argument('--output', required=output_required,
+                        help='review CSV path; prepare defaults to STATE_DIRECTORY/plan.csv')
+    parser.add_argument('--destination', required=True, help='new library folder to create after approval')
+    parser.add_argument('--config')
+    parser.add_argument('--use-geocoding', action=argparse.BooleanOptionalAction, default=True,
+                        help='use cached city names by default; never makes network requests')
+    if include_location_cache_options:
+        parser.add_argument('--geocode-precision', type=int, choices=(2, 3, 4), default=2)
+        parser.add_argument('--language', default='en')
+    parser.add_argument('--grouping', choices=('broad', 'events'), default='broad',
+                        help='broad source albums and year/location folders (default), or short time events')
+    parser.add_argument('--location-radius-km', type=positive, default=20,
+                        help='radius around each GPS area anchor in broad mode')
+    parser.add_argument('--ignore-source-context', action='store_true', help='do not use source folders as album context')
+    parser.add_argument('--gap-hours', type=positive, default=6)
+    parser.add_argument('--max-event-hours', type=positive, default=36)
+    parser.add_argument('--distance-km', type=positive, default=30)
+    parser.add_argument('--preserve-folders', action='store_true')
+
+
 @contextmanager
 def state_lock(state):
     state.mkdir(parents=True, exist_ok=True)
@@ -734,16 +869,12 @@ def state_lock(state):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    p = sub.add_parser('scan', help='inventory photos and optionally expand archives into staging')
-    p.add_argument('source')
-    p.add_argument('--state', required=True, help='local working directory, preferably not on NAS')
-    p.add_argument('--exclude', action='append', default=[])
-    p.add_argument('--extract-archives', action='store_true')
-    p.add_argument('--max-expanded-gb', type=positive, default=20)
-    p.add_argument('--max-archive-members', type=int, default=100000)
-    p.add_argument('--max-archive-depth', type=int, default=3)
-    p.add_argument('--refresh', action='store_true', help='reread metadata and checksums even for unchanged file stats')
-    p.add_argument('--max-photos', type=int, help='limit the scan to this many photos for a pilot; naming rules are unchanged')
+    p = sub.add_parser('prepare', help='scan, resolve locations, and create a review plan; no media writes')
+    add_scan_arguments(p)
+    add_plan_arguments(p, include_state=False, output_required=False, include_location_cache_options=False)
+    p.set_defaults(func=prepare)
+    p = sub.add_parser('scan', help='inventory photos, resolve GPS locations, and optionally expand archives')
+    add_scan_arguments(p)
     p.set_defaults(func=scan)
     p = sub.add_parser('geocode', help='preview or fetch cached city names for inventoried GPS coordinates')
     p.add_argument('--state', required=True)
@@ -754,25 +885,12 @@ def main():
     p.add_argument('--request-interval', type=positive, default=1.1)
     p.set_defaults(func=geocode)
     p = sub.add_parser('plan', help='write a reviewable CSV; no media writes')
-    p.add_argument('--state', required=True)
-    p.add_argument('--output', required=True)
-    p.add_argument('--destination', required=True, help='new library folder to create after approval')
-    p.add_argument('--config')
-    p.add_argument('--use-geocoding', action=argparse.BooleanOptionalAction, default=True, help='use cached city names by default; never makes network requests')
-    p.add_argument('--geocode-precision', type=int, choices=(2, 3, 4), default=2)
-    p.add_argument('--language', default='en')
-    p.add_argument('--grouping', choices=('broad', 'events'), default='broad', help='broad source albums and year/location folders (default), or short time events')
-    p.add_argument('--location-radius-km', type=positive, default=20, help='radius around each GPS area anchor in broad mode')
-    p.add_argument('--ignore-source-context', action='store_true', help='do not use source folders as album context')
-    p.add_argument('--gap-hours', type=positive, default=6)
-    p.add_argument('--max-event-hours', type=positive, default=36)
-    p.add_argument('--distance-km', type=positive, default=30)
-    p.add_argument('--preserve-folders', action='store_true')
+    add_plan_arguments(p)
     p.set_defaults(func=plan)
-    p = sub.add_parser('apply', help='preview or approve moving a reviewed plan into the new library')
+    p = sub.add_parser('apply', help='preview or approve transferring a reviewed plan into the new library')
     p.add_argument('--state', required=True)
-    p.add_argument('--plan', required=True)
-    p.add_argument('--destination', required=True)
+    p.add_argument('--plan', help='review CSV; defaults to STATE_DIRECTORY/plan.csv')
+    p.add_argument('--destination', help='optional safety check; defaults to the destination saved with the plan')
     p.add_argument('--mode', choices=('move', 'copy'), default='move')
     p.add_argument('--approve', action='store_true', help='approve execution of the reviewed plan; otherwise preview only')
     p.set_defaults(func=apply)
