@@ -9,6 +9,7 @@ Desktop.ini
 inventory.sqlite3*
 organizer.lock
 extracted/
+.photo-organizer-extracted/
 scan-report.json
 apply-log.jsonl
 plan.csv

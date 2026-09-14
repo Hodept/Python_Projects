@@ -118,9 +118,10 @@ def safe_member(name):
 
 
 class Extractor:
-    def __init__(self, state, max_bytes, max_members):
-        self.root = state / 'extracted'
-        self.root.mkdir(exist_ok=True)
+    def __init__(self, root, max_bytes, max_members):
+        self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / '.photo-organizer-staging').touch(exist_ok=True)
         self.remaining = max_bytes
         self.members = max_members
 
@@ -211,10 +212,19 @@ def scan(args):
     if previous and previous[0] != str(source):
         raise ValueError('use a separate state directory for each source root')
     run = uuid.uuid4().hex
-    excluded = [state, *[Path(p).resolve() for p in args.exclude]]
+    extraction_directory = getattr(args, 'extraction_directory', None)
+    extraction_candidate = Path(extraction_directory) if extraction_directory else source / '.photo-organizer-extracted'
+    if extraction_candidate.is_symlink():
+        raise ValueError('extraction directory must not be a symlink')
+    extraction_root = extraction_candidate.resolve()
+    if extraction_root == source:
+        raise ValueError('extraction directory must not be the source directory itself')
+    if within(extraction_root, state) or within(state, extraction_root):
+        raise ValueError('extraction directory must be separate from the state directory')
+    excluded = [state, extraction_root, *[Path(p).resolve() for p in args.exclude]]
     if any(within(source, e) for e in excluded):
         raise ValueError('an exclusion contains the entire source')
-    extractor = Extractor(state, int(args.max_expanded_gb * 1024**3), args.max_archive_members) if args.extract_archives else None
+    extractor = Extractor(extraction_root, int(args.max_expanded_gb * 1024**3), args.max_archive_members) if args.extract_archives else None
     pending = []
     counts = {'photos': 0, 'cached': 0, 'other_files': 0, 'archives': 0}
     limit = getattr(args, 'max_photos', None)
@@ -287,6 +297,7 @@ def scan(args):
     visit(source)
     flush()
     db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('source', str(source)))
+    db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('extraction_root', str(extraction_root)))
     db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('run', run))
     db.commit()
     geocoding_failed = False
@@ -303,11 +314,14 @@ def scan(args):
     warnings = [dict(r) for r in db.execute("SELECT source,problem FROM issues WHERE run=? AND severity='warning'", (run,))]
     errors = [dict(r) for r in db.execute("SELECT source,problem FROM issues WHERE run=? AND severity='error'", (run,))]
     (state / 'scan-report.json').write_text(json.dumps({**counts, 'partial_scan': limited, 'max_photos': limit,
+                                                        'extraction_directory': str(extraction_root) if extractor else None,
                                                         'geocoding': geocoding_report,
                                                         'warnings': warnings, 'errors': errors}, indent=2))
     print(f"Scan complete: {counts['photos']} photos ({counts['cached']} reused), "
           f"{counts['archives']} archives, {counts['other_files']} other files.")
     print(f"Geocoding: {geocoding_report['status']}.")
+    if extractor:
+        print(f'Archive staging: {extraction_root}.')
     if warnings:
         print(f'{len(warnings)} metadata warnings were recorded in {state / "scan-report.json"}.')
     if errors:
@@ -681,6 +695,8 @@ def apply(args):
     if not setting:
         raise ValueError('run prepare or scan first')
     source_root = Path(setting[0])
+    extraction_setting = db.execute("SELECT value FROM settings WHERE key='extraction_root'").fetchone()
+    extraction_root = Path(extraction_setting[0]) if extraction_setting else state / 'extracted'
     plan_path = Path(args.plan).resolve() if getattr(args, 'plan', None) else state / 'plan.csv'
     summary = json.loads(plan_path.with_suffix('.summary.json').read_text())
     planned_destination = summary.get('destination')
@@ -701,7 +717,7 @@ def apply(args):
         src = Path(row['source'])
         if not src.is_absolute() or src.is_symlink() or src.resolve() != src:
             raise ValueError(f'source path is not canonical or is a symlink: {src}')
-        if not (within(src, source_root) or within(src, state / 'extracted')):
+        if not (within(src, source_root) or within(src, extraction_root)):
             raise ValueError(f'source is outside inventory roots: {src}')
         if str(src) in sources:
             raise ValueError(f'duplicate source in plan: {src}')
@@ -771,7 +787,7 @@ def apply(args):
                     status = 'copied'
                 # Retain extraction caches and original archives: an archive can
                 # also contain documents or photos not included in this plan.
-                if args.mode == 'move' and within(src, source_root) and not within(src, state / 'extracted'):
+                if args.mode == 'move' and within(src, source_root) and not within(src, extraction_root):
                     before = src.stat()
                     if src.is_symlink() or src.resolve() != src or digest(src) != row['sha256']:
                         raise ValueError('source changed before removal; retained source and copy')
@@ -815,7 +831,9 @@ def add_scan_arguments(parser):
     parser.add_argument('--exclude', action='append', default=[])
     parser.add_argument('--extract-archives', action=argparse.BooleanOptionalAction, default=True,
                         help='expand supported archives (default); use --no-extract-archives to skip them')
-    parser.add_argument('--max-expanded-gb', type=positive, default=20)
+    parser.add_argument('--extraction-directory',
+                        help='archive staging directory; defaults to .photo-organizer-extracted inside the source')
+    parser.add_argument('--max-expanded-gb', type=positive, default=250)
     parser.add_argument('--max-archive-members', type=int, default=100000)
     parser.add_argument('--max-archive-depth', type=int, default=10)
     parser.add_argument('--refresh', action='store_true', help='reread metadata and checksums even for unchanged file stats')

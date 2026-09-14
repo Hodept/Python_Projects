@@ -11,7 +11,7 @@ Install:
 - Python 3.10 or newer. The commands below use `python`; substitute `python3` or `py` if needed.
 - [ExifTool](https://exiftool.org/) and confirm that `exiftool -ver` works in your terminal.
 - A [Geoapify](https://www.geoapify.com/) API key for readable location names. Store it in the `GEOAPIFY_API_KEY` environment variable or create the state directory before preparation and place the key in its `geoapify-key.txt` file.
-- Enough free space for the organized library. Archive extraction also needs local working space.
+- Enough free space for the organized library. Archive extraction also needs working space on the source volume by default.
 
 Choose three paths:
 
@@ -47,7 +47,6 @@ The state directory contains working data such as:
   inventory.sqlite3       Local photo inventory, hashes, and metadata
   scan-report.json        Scan counts, warnings, and geocoding status
   geocoding-report.json   Location lookup results summary
-  extracted/              Private staging for supported archives
   plan.csv                Proposed operation list created by prepare
   plan.duplicates.csv     Exact duplicate photos excluded from the plan
   plan.summary.json       Summary associated with the plan
@@ -89,7 +88,7 @@ This command:
 - walks the source folder and its subfolders;
 - reads photo metadata and calculates a full SHA-256 hash;
 - resolves new GPS locations into readable place names and caches the results;
-- expands supported archives into private staging, including archives nested up to 10 levels deep;
+- expands supported archives into hidden staging on the source volume, including archives nested up to 10 levels deep;
 - stops after 600 photos and records that the inventory is partial;
 - creates `.photo-organizer-state/plan.csv` and its summary automatically;
 - leaves every source file unchanged.
@@ -187,7 +186,7 @@ By default, `apply` reads `plan.csv` and its recorded destination from the state
 
 For every transfer, the program verifies the source SHA-256, copies the file, flushes and verifies the destination, and records the result. In move mode it rechecks the source before deleting it. A checksum conflict or transfer failure leaves the source photo in place and never overwrites a different destination file.
 
-Photos extracted from archives are copied from staging even in move mode. Original archives remain intact because they may contain other files. Empty source folders are not removed.
+Photos extracted from archives are copied from staging even in move mode. Their staged copies and original archives remain intact because an archive may contain other files. Empty source folders are not removed.
 
 ## 6. Prepare the complete collection
 
@@ -276,13 +275,17 @@ Configuration sections:
 
 Supported photos include JPEG, HEIC/HEIF, PNG, TIFF, WebP, AVIF, GIF, BMP, JXL, DNG, and common camera RAW formats.
 
-ZIP and TAR archives—including gzip, bzip2, and xz-compressed TAR files—are expanded by default. Nested archives are supported to 10 levels. Safety limits default to 20 GiB of expanded content and 100,000 archive members:
+ZIP and TAR archives—including gzip, bzip2, and xz-compressed TAR files—are expanded by default. Nested archives are supported to 10 levels. Extracted content is stored in `.photo-organizer-extracted` inside the source directory, which keeps the large staging cache on the same drive as the source. The scanner excludes this hidden working directory from ordinary traversal.
+
+Safety limits default to 250 GiB of expanded content and 100,000 archive members:
 
 ```text
-python photo_organizer.py prepare "SOURCE_DIRECTORY" --state ".photo-organizer-state" --destination "DESTINATION_DIRECTORY" --max-expanded-gb 50 --max-archive-members 200000 --max-archive-depth 10
+python photo_organizer.py prepare "SOURCE_DIRECTORY" --state ".photo-organizer-state" --destination "DESTINATION_DIRECTORY" --max-expanded-gb 500 --max-archive-members 200000 --max-archive-depth 10
 ```
 
 Use `--no-extract-archives` when archives should be skipped. Unsafe paths, links, special files, corrupt archives, and limit violations are reported without extracting incomplete content. Password-protected archives, RAR, 7z, and standalone compressed streams must be unpacked separately.
+
+Use `--extraction-directory "STAGING_DIRECTORY"` to put staging somewhere else. The selected directory must be separate from the state directory and cannot be the source directory itself. It should be on a drive with enough capacity for the value supplied through `--max-expanded-gb`.
 
 Videos, documents, external XMP/AAE sidecars, Google Takeout JSON, and Live Photo video companions are not organized in this photo phase. In move mode, a still photo may move while its external companion remains in the source tree. Use copy mode when those relationships need to remain intact.
 

@@ -63,9 +63,14 @@ class OrganizerTests(unittest.TestCase):
         rows = self.plan()
         self.assertEqual(len(rows), 2)
         self.assertTrue(any('!/' in r['original_relative'] for r in rows))
+        extraction_root = self.source / '.photo-organizer-extracted'
+        self.assertTrue(extraction_root.is_dir())
+        self.assertFalse((self.state / 'extracted').exists())
+        self.assertTrue(all(app.within(Path(row['source']), extraction_root) for row in rows))
         self.scan()
         report = json.loads((self.state / 'scan-report.json').read_text())
         self.assertEqual(report['cached'], 2)
+        self.assertEqual(report['extraction_directory'], str(extraction_root))
         self.assertEqual(self.apply(), 0)
         self.assertEqual(len(list(self.dest.rglob('*.jpg'))), 2)
         self.assertTrue((self.source / 'photos.zip').exists())
@@ -79,7 +84,7 @@ class OrganizerTests(unittest.TestCase):
             p = tarfile.TarInfo('./photo.jpg')
             p.size = 3
             arc.addfile(p, io.BytesIO(b'abc'))
-        extract = app.Extractor(self.state, 10000, 100)
+        extract = app.Extractor(self.state / 'extracted', 10000, 100)
         self.assertEqual((extract.extract(tar) / 'photo.jpg').read_bytes(), b'abc')
         bad = self.source / 'bad.tar'
         with tarfile.open(bad, 'w') as arc:
@@ -96,12 +101,12 @@ class OrganizerTests(unittest.TestCase):
             with zipfile.ZipFile(archive, 'w') as z:
                 z.writestr(name, b'photo')
             with self.assertRaises(ValueError):
-                app.Extractor(self.state, 1000, 10).extract(archive)
+                app.Extractor(self.state / 'extracted', 1000, 10).extract(archive)
         archive = self.source / 'large.zip'
         with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as z:
             z.writestr('large.jpg', b'0' * 10000)
         with self.assertRaises(ValueError):
-            app.Extractor(self.state, 100, 10).extract(archive)
+            app.Extractor(self.state / 'extracted', 100, 10).extract(archive)
         self.assertFalse(list((self.state / 'extracted').glob('*.partial-*')))
 
     def test_apply_resume_duplicates_and_changed_source(self):
@@ -216,6 +221,7 @@ class OrganizerTests(unittest.TestCase):
         base = ['prepare', str(self.source), '--state', str(self.state), '--destination', str(self.dest)]
         args = parser.parse_args(base)
         self.assertTrue(args.extract_archives)
+        self.assertEqual(args.max_expanded_gb, 250)
         self.assertEqual(args.max_archive_depth, 10)
         args = parser.parse_args([*base, '--no-extract-archives'])
         self.assertFalse(args.extract_archives)
